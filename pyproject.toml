@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "shiori"
+version = "0.1.0"
+description = "Discord通話録音 (Craig) → Whisper → Claude Code → Notion パイプライン"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "groq>=0.11.0",
+    "requests>=2.31.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.scripts]
+shiori = "shiori.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["shiori"]
