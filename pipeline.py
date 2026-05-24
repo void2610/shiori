@@ -523,6 +523,19 @@ def detect_parent_type(notion: NotionClient, parent_id: str) -> str:
         raise
 
 
+def _database_title_prop(notion: NotionClient, database_id: str) -> str:
+    """DB のタイトル列名は任意 (Name / 名前 / Title 等) なのでスキーマから取得。"""
+    db = notion.databases.retrieve(database_id=database_id)
+    props = db.get("properties", {})
+    for name, prop in props.items():
+        if prop.get("type") == "title":
+            return name
+    sys.exit(
+        f"データベース {database_id} に title 型のプロパティが見つかりません。"
+        f" 利用可能: {list(props.keys())}"
+    )
+
+
 def post_to_notion(
     notion: NotionClient,
     parent_id: str,
@@ -532,7 +545,8 @@ def post_to_notion(
 ) -> str:
     if parent_type == "database":
         parent = {"database_id": parent_id}
-        properties = {"Name": {"title": _rich_text(title)}}
+        title_prop = _database_title_prop(notion, parent_id)
+        properties = {title_prop: {"title": _rich_text(title)}}
     else:
         parent = {"page_id": parent_id}
         properties = {"title": {"title": _rich_text(title)}}
