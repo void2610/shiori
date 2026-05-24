@@ -1,0 +1,13 @@
+.env
+.env.local
+__pycache__/
+*.pyc
+.venv/
+venv/
+.uv-cache/
+
+# 入出力フォルダ配下のデータは追跡しない (.gitkeep のみ)
+input/*
+!input/.gitkeep
+output/*
+!output/.gitkeep

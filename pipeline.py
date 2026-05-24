@@ -1,0 +1,415 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#   "groq>=0.11.0",
+#   "notion-client>=2.2.1",
+#   "requests>=2.31.0",
+#   "python-dotenv>=1.0.0",
+# ]
+# ///
+"""Discord通話録音 (Craig) → Groq Whisper 文字起こし → Claude Code 要約 → Notion 投稿。
+
+前提:
+  - ffmpeg / ffprobe が PATH 上にあること
+  - `claude` CLI (Claude Code) が PATH 上にあること
+  - 環境変数: GROQ_API_KEY, NOTION_API_KEY, NOTION_PARENT_ID
+  - Notion インテグレーションを親ページ / DB に招待済みであること
+
+使用例:
+  # 1. Craig 公式ページから録音を手元にダウンロード (推奨: single-track FLAC)
+  # 2. このスクリプトに渡す
+  python pipeline.py ~/Downloads/craig-xxx.flac --title "週次定例 2026-05-24"
+
+  # 直接ダウンロード URL を指定する場合
+  python pipeline.py "https://craig.horse/rec/XXXX?key=YYY&format=flac&container=mix"
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from datetime import datetime
+from pathlib import Path
+from typing import Iterable
+from urllib.parse import urlparse
+
+import requests
+from dotenv import load_dotenv
+from groq import Groq
+from notion_client import Client as NotionClient
+
+# スクリプトと同階層の .env を最優先、次にカレントの .env を読む。
+# 既存の環境変数は上書きしない (export 済みの値を尊重)。
+load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
+load_dotenv(override=False)
+
+# Groq Whisper の 1 リクエスト上限は 25MB。少し余裕を持たせる。
+MAX_CHUNK_BYTES = 24 * 1024 * 1024
+# Notion の rich_text 1 要素は 2000 文字、children は 1 リクエスト 100 ブロックまで。
+NOTION_TEXT_CHUNK = 1900
+NOTION_BLOCK_BATCH = 100
+
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "whisper-large-v3")
+
+
+# ---------- 共通ユーティリティ ----------
+
+def require_env(name: str) -> str:
+    value = os.environ.get(name)
+    if not value:
+        sys.exit(f"環境変数 {name} が未設定です")
+    return value
+
+
+def log(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)
+
+
+# ---------- 1. 録音データの取得 ----------
+
+def fetch_recording(source: str, workdir: Path) -> Path:
+    """ローカルパス または HTTP(S) URL を受け取り、ローカルファイルパスを返す。"""
+    if source.startswith(("http://", "https://")):
+        name = Path(urlparse(source).path).name or "recording.bin"
+        dest = workdir / name
+        log(f"[1/4] ダウンロード中: {source}")
+        with requests.get(source, stream=True, timeout=600) as r:
+            r.raise_for_status()
+            with open(dest, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+        return dest
+
+    path = Path(source).expanduser().resolve()
+    if not path.exists():
+        sys.exit(f"録音ファイルが見つかりません: {path}")
+    log(f"[1/4] ローカル録音を使用: {path}")
+    return path
+
+
+# ---------- 2. 音声を Whisper 向けに整形 ----------
+
+def to_whisper_friendly(src: Path, workdir: Path) -> Path:
+    """16kHz / モノラル / AAC 64kbps に変換し、サイズと帯域を抑える。"""
+    out = workdir / (src.stem + ".m4a")
+    cmd = [
+        "ffmpeg", "-y", "-i", str(src),
+        "-vn",
+        "-ac", "1",
+        "-ar", "16000",
+        "-c:a", "aac", "-b:a", "64k",
+        str(out),
+    ]
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return out
+
+
+def audio_duration_seconds(path: Path) -> float:
+    out = subprocess.check_output([
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(path),
+    ]).decode().strip()
+    return float(out)
+
+
+def split_if_large(path: Path, workdir: Path) -> list[Path]:
+    """25MB を超える場合だけ時間ベースで分割する。"""
+    size = path.stat().st_size
+    if size <= MAX_CHUNK_BYTES:
+        return [path]
+
+    duration = audio_duration_seconds(path)
+    # 1 チャンクあたりの目安秒数 (バイト比から逆算)
+    chunk_seconds = max(60, int(duration * MAX_CHUNK_BYTES / size) - 5)
+    n = math.ceil(duration / chunk_seconds)
+    log(f"  入力が {size/1e6:.1f}MB あるため {n} 分割します (約 {chunk_seconds}s/chunk)")
+
+    parts: list[Path] = []
+    for i in range(n):
+        start = i * chunk_seconds
+        out = workdir / f"{path.stem}_part{i:03d}.m4a"
+        subprocess.run([
+            "ffmpeg", "-y",
+            "-ss", str(start), "-t", str(chunk_seconds),
+            "-i", str(path),
+            "-c", "copy",
+            str(out),
+        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        parts.append(out)
+    return parts
+
+
+# ---------- 3. Groq Whisper で文字起こし ----------
+
+def transcribe(audio: Path, groq: Groq, language: str | None, prompt: str | None) -> str:
+    with open(audio, "rb") as f:
+        data = f.read()
+    params: dict = {
+        "file": (audio.name, data, "audio/m4a"),
+        "model": WHISPER_MODEL,
+        "response_format": "text",
+        "temperature": 0,
+    }
+    if language:
+        params["language"] = language
+    if prompt:
+        params["prompt"] = prompt
+    result = groq.audio.transcriptions.create(**params)
+    if isinstance(result, str):
+        return result.strip()
+    return getattr(result, "text", str(result)).strip()
+
+
+def transcribe_all(chunks: list[Path], groq: Groq, language: str | None) -> str:
+    transcripts: list[str] = []
+    prev_tail: str | None = None
+    for i, chunk in enumerate(chunks, 1):
+        log(f"  - チャンク {i}/{len(chunks)} を Whisper に送信中...")
+        text = transcribe(chunk, groq, language, prompt=prev_tail)
+        transcripts.append(text)
+        # 文脈ヒント用に直近の末尾を次チャンクへ渡す (最大 200 文字)
+        prev_tail = text[-200:] if text else None
+    return "\n".join(transcripts).strip()
+
+
+# ---------- 4. Claude Code で要約 ----------
+
+SUMMARY_PROMPT_TEMPLATE = """以下は Discord で行われた通話の文字起こしです。日本語で読みやすい議事録 (Markdown) に整形してください。
+
+# 出力フォーマット
+## 概要
+- 通話全体を 3〜5 行で要約
+
+## 主な議題
+- 議題ごとに見出しを設けず、箇条書きで「議論内容 / 結論 / 補足」をまとめる
+
+## 決定事項
+- 箇条書き。決まったことだけを簡潔に
+
+## ToDo / ネクストアクション
+- [ ] 担当者: 内容 (期限が明示されていれば末尾に「(〜まで)」)
+
+## 未解決の論点
+- 箇条書き。なければ「なし」と書く
+
+# 制約
+- 文字起こしは音声認識の誤りを含むため、明らかに不自然な単語は文脈から補正してよい
+- 推測で情報を増やさない。元の発言にない事実は書かない
+- 出力は Markdown 本文のみ。前置きや「了解しました」等は不要
+
+# 文字起こし
+{transcript}
+"""
+
+
+def summarize_with_claude(transcript: str, claude_bin: str) -> str:
+    prompt = SUMMARY_PROMPT_TEMPLATE.format(transcript=transcript)
+    proc = subprocess.run(
+        [claude_bin, "-p", prompt],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        sys.exit(
+            f"claude CLI がエラー終了しました (exit={proc.returncode})\n"
+            f"stderr:\n{proc.stderr}"
+        )
+    return proc.stdout.strip()
+
+
+# ---------- 5. Markdown → Notion blocks ----------
+
+def _rich_text(text: str) -> list[dict]:
+    if not text:
+        return [{"type": "text", "text": {"content": ""}}]
+    chunks = [text[i:i + 2000] for i in range(0, len(text), 2000)]
+    return [{"type": "text", "text": {"content": c}} for c in chunks]
+
+
+def _heading(level: int, text: str) -> dict:
+    key = f"heading_{min(max(level, 1), 3)}"
+    return {"object": "block", "type": key, key: {"rich_text": _rich_text(text)}}
+
+
+def _paragraph(text: str) -> dict:
+    return {
+        "object": "block",
+        "type": "paragraph",
+        "paragraph": {"rich_text": _rich_text(text)},
+    }
+
+
+def md_to_blocks(md: str) -> list[dict]:
+    """最小限の Markdown → Notion block 変換 (見出し / 箇条書き / TODO / 段落)。"""
+    blocks: list[dict] = []
+    for raw in md.splitlines():
+        line = raw.rstrip()
+        if not line.strip():
+            continue
+
+        stripped = line.lstrip()
+
+        if stripped.startswith("### "):
+            blocks.append(_heading(3, stripped[4:]))
+        elif stripped.startswith("## "):
+            blocks.append(_heading(2, stripped[3:]))
+        elif stripped.startswith("# "):
+            blocks.append(_heading(1, stripped[2:]))
+        elif stripped.startswith(("- [ ] ", "- [x] ", "- [X] ")):
+            checked = stripped[3].lower() == "x"
+            text = stripped[6:]
+            blocks.append({
+                "object": "block",
+                "type": "to_do",
+                "to_do": {"rich_text": _rich_text(text), "checked": checked},
+            })
+        elif stripped.startswith(("- ", "* ")):
+            blocks.append({
+                "object": "block",
+                "type": "bulleted_list_item",
+                "bulleted_list_item": {"rich_text": _rich_text(stripped[2:])},
+            })
+        else:
+            blocks.append(_paragraph(line))
+    return blocks
+
+
+def transcript_blocks(transcript: str) -> list[dict]:
+    """文字起こし全文を段落ブロック群として返す (1 ブロック 1900 文字)。"""
+    blocks: list[dict] = [_heading(2, "文字起こし全文")]
+    for i in range(0, len(transcript), NOTION_TEXT_CHUNK):
+        blocks.append(_paragraph(transcript[i:i + NOTION_TEXT_CHUNK]))
+    return blocks
+
+
+# ---------- 6. Notion へ投稿 ----------
+
+def post_to_notion(
+    notion: NotionClient,
+    parent_id: str,
+    parent_type: str,
+    title: str,
+    body_blocks: list[dict],
+) -> str:
+    if parent_type == "database":
+        parent = {"database_id": parent_id}
+        properties = {"Name": {"title": _rich_text(title)}}
+    else:
+        parent = {"page_id": parent_id}
+        properties = {"title": {"title": _rich_text(title)}}
+
+    page = notion.pages.create(
+        parent=parent,
+        properties=properties,
+        children=body_blocks[:NOTION_BLOCK_BATCH],
+    )
+    page_id = page["id"]
+
+    for i in range(NOTION_BLOCK_BATCH, len(body_blocks), NOTION_BLOCK_BATCH):
+        notion.blocks.children.append(
+            block_id=page_id,
+            children=body_blocks[i:i + NOTION_BLOCK_BATCH],
+        )
+    return page.get("url", f"https://www.notion.so/{page_id.replace('-', '')}")
+
+
+# ---------- main ----------
+
+def main(argv: Iterable[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Craig 録音 → Whisper → Claude Code 要約 → Notion 投稿パイプライン",
+    )
+    parser.add_argument("source", help="録音ファイルパス または 直接ダウンロード URL")
+    parser.add_argument("--title", default=None, help="Notion ページタイトル")
+    parser.add_argument("--language", default="ja",
+                        help="Whisper 言語コード (空文字で自動判定)")
+    parser.add_argument("--parent-type",
+                        choices=["page", "database"],
+                        default=os.environ.get("NOTION_PARENT_TYPE", "page"),
+                        help="NOTION_PARENT_ID が page か database か")
+    parser.add_argument("--claude-bin",
+                        default=os.environ.get("CLAUDE_BIN", "claude"),
+                        help="claude CLI の実行パス")
+    parser.add_argument("--keep-workdir", action="store_true",
+                        help="作業ディレクトリを残す (デバッグ用)")
+    parser.add_argument("--skip-notion", action="store_true",
+                        help="Notion 投稿をスキップし、要約と文字起こしを stdout に出力")
+    parser.add_argument("--save-transcript", default=None,
+                        help="文字起こしを指定パスに保存")
+    parser.add_argument("--save-summary", default=None,
+                        help="要約を指定パスに保存")
+    args = parser.parse_args(argv)
+
+    groq_key = require_env("GROQ_API_KEY")
+    if not args.skip_notion:
+        notion_key = require_env("NOTION_API_KEY")
+        parent_id = require_env("NOTION_PARENT_ID")
+
+    if shutil.which(args.claude_bin) is None:
+        sys.exit(f"claude CLI が見つかりません: {args.claude_bin}")
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        sys.exit("ffmpeg / ffprobe が PATH 上に必要です")
+
+    title = args.title or f"Discord 通話メモ {datetime.now():%Y-%m-%d %H:%M}"
+    workdir = Path(tempfile.mkdtemp(prefix="craig_pipeline_"))
+    log(f"作業ディレクトリ: {workdir}")
+
+    try:
+        # 1. 録音取得
+        raw = fetch_recording(args.source, workdir)
+
+        # 2. Whisper 用に変換し、必要なら分割
+        log("[2/4] 音声を変換中...")
+        audio = to_whisper_friendly(raw, workdir)
+        chunks = split_if_large(audio, workdir)
+
+        # 3. 文字起こし
+        log(f"[3/4] Whisper ({WHISPER_MODEL}) で文字起こし中...")
+        groq = Groq(api_key=groq_key)
+        transcript = transcribe_all(chunks, groq, args.language or None)
+        if args.save_transcript:
+            Path(args.save_transcript).write_text(transcript, encoding="utf-8")
+            log(f"  文字起こしを保存: {args.save_transcript}")
+
+        # 4. Claude Code で要約
+        log("[4/4] Claude Code で要約中...")
+        summary_md = summarize_with_claude(transcript, args.claude_bin)
+        if args.save_summary:
+            Path(args.save_summary).write_text(summary_md, encoding="utf-8")
+            log(f"  要約を保存: {args.save_summary}")
+
+        if args.skip_notion:
+            print("=== 要約 (Markdown) ===")
+            print(summary_md)
+            print("\n=== 文字起こし ===")
+            print(transcript)
+            return 0
+
+        # 5. Notion 投稿
+        body = md_to_blocks(summary_md) + transcript_blocks(transcript)
+        url = post_to_notion(
+            NotionClient(auth=notion_key),
+            parent_id,
+            args.parent_type,
+            title,
+            body,
+        )
+        print(f"Notion に投稿しました: {url}")
+        return 0
+    finally:
+        if not args.keep_workdir:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
