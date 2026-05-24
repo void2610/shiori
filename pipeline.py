@@ -59,6 +59,19 @@ NOTION_BLOCK_BATCH = 100
 NOTION_API_BASE = "https://api.notion.com/v1"
 NOTION_VERSION = "2025-09-03"
 
+# 出力先は固定。タイトル/ファイル名は実行日から自動生成する。
+OUTPUT_DIR = Path(__file__).resolve().parent / "output"
+
+
+def today_artifacts() -> tuple[str, Path, Path]:
+    """(title, transcript_path, summary_path) を実行日から生成して返す。"""
+    base = f"{datetime.now():%Y-%m-%d} mtg"
+    return (
+        base,
+        OUTPUT_DIR / f"{base}.transcript.txt",
+        OUTPUT_DIR / f"{base}.summary.md",
+    )
+
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "whisper-large-v3")
 
 # マルチトラック処理で対応する音声拡張子
@@ -692,7 +705,6 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("source", nargs="?", default=None,
                         help="録音ファイルパス または 直接ダウンロード URL "
                              "(--post-only 時は省略可)")
-    parser.add_argument("--title", default=None, help="Notion ページタイトル")
     parser.add_argument("--language", default="ja",
                         help="Whisper 言語コード (空文字で自動判定)")
     parser.add_argument("--parent-type",
@@ -706,19 +718,11 @@ def main(argv: Iterable[str] | None = None) -> int:
                         help="作業ディレクトリを残す (デバッグ用)")
     parser.add_argument("--skip-notion", action="store_true",
                         help="Notion 投稿をスキップし、要約と文字起こしを stdout に出力")
-    parser.add_argument("--save-transcript", default=None,
-                        help="文字起こしを指定パスに保存")
-    parser.add_argument("--save-summary", default=None,
-                        help="要約を指定パスに保存")
     parser.add_argument("--mode", choices=["auto", "single", "multitrack"],
                         default="auto",
                         help="auto: ZIP かつ複数トラックを検出したら multitrack に切替")
     parser.add_argument("--post-only", action="store_true",
-                        help="Whisper/Claude をスキップし、既存ファイルから Notion 投稿")
-    parser.add_argument("--summary-file", default=None,
-                        help="--post-only 時に読む要約 Markdown ファイル")
-    parser.add_argument("--transcript-file", default=None,
-                        help="--post-only 時に読む文字起こしファイル (任意)")
+                        help="Whisper/Claude をスキップし、当日の output から Notion 投稿")
     parser.add_argument("--property", action="append", default=[], dest="properties",
                         metavar="NAME=VALUE",
                         help="DB の追加プロパティ。multi_select は ',' 区切り。"
@@ -726,17 +730,19 @@ def main(argv: Iterable[str] | None = None) -> int:
                              "(複数回指定可)")
     args = parser.parse_args(argv)
 
+    title, transcript_path, summary_path = today_artifacts()
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
     if args.post_only:
         if args.skip_notion:
             sys.exit("--post-only と --skip-notion は同時指定できません")
-        if not args.summary_file:
-            sys.exit("--post-only には --summary-file が必須です")
+        if not summary_path.exists():
+            sys.exit(f"要約ファイルが見つかりません: {summary_path}")
         notion_key = require_env("NOTION_API_KEY")
         parent_id = require_env("NOTION_PARENT_ID")
-        summary_md = Path(args.summary_file).read_text(encoding="utf-8")
-        transcript = (Path(args.transcript_file).read_text(encoding="utf-8")
-                      if args.transcript_file else "")
-        title = args.title or f"Discord 通話メモ {datetime.now():%Y-%m-%d %H:%M}"
+        summary_md = summary_path.read_text(encoding="utf-8")
+        transcript = (transcript_path.read_text(encoding="utf-8")
+                      if transcript_path.exists() else "")
         body = md_to_blocks(summary_md)
         if transcript:
             body += transcript_blocks(transcript)
@@ -759,9 +765,9 @@ def main(argv: Iterable[str] | None = None) -> int:
     if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
         sys.exit("ffmpeg / ffprobe が PATH 上に必要です")
 
-    title = args.title or f"Discord 通話メモ {datetime.now():%Y-%m-%d %H:%M}"
     workdir = Path(tempfile.mkdtemp(prefix="craig_pipeline_"))
     log(f"作業ディレクトリ: {workdir}")
+    log(f"出力タイトル: {title}")
 
     try:
         # 1. 録音取得
@@ -788,16 +794,14 @@ def main(argv: Iterable[str] | None = None) -> int:
             log(f"[3/4] Whisper ({WHISPER_MODEL}) で文字起こし中...")
             transcript = transcribe_all(chunks, groq, args.language or None)
 
-        if args.save_transcript:
-            Path(args.save_transcript).write_text(transcript, encoding="utf-8")
-            log(f"  文字起こしを保存: {args.save_transcript}")
+        transcript_path.write_text(transcript, encoding="utf-8")
+        log(f"  文字起こしを保存: {transcript_path}")
 
         # 4. Claude Code で要約
         log("[4/4] Claude Code で要約中...")
         summary_md = summarize_with_claude(transcript, args.claude_bin, multitrack)
-        if args.save_summary:
-            Path(args.save_summary).write_text(summary_md, encoding="utf-8")
-            log(f"  要約を保存: {args.save_summary}")
+        summary_path.write_text(summary_md, encoding="utf-8")
+        log(f"  要約を保存: {summary_path}")
 
         if args.skip_notion:
             print("=== 要約 (Markdown) ===")

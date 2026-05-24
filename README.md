@@ -49,11 +49,13 @@ NOTION_PARENT_ID=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 ### single (mix) モード
 
 ```bash
-uv run pipeline.py input/craig-xxx.flac \
-  --title "週次定例 2026-05-24" \
-  --save-transcript output/2026-05-24.transcript.txt \
-  --save-summary    output/2026-05-24.summary.md
+uv run pipeline.py input/craig-xxx.flac
 ```
+
+出力先 / Notion タイトルは実行日から自動決定:
+- `output/yyyy-mm-dd mtg.transcript.txt`
+- `output/yyyy-mm-dd mtg.summary.md`
+- Notion ページタイトル: `yyyy-mm-dd mtg`
 
 ### multitrack モード (推奨: 話者付き議事録)
 
@@ -85,11 +87,8 @@ uv run pipeline.py input.flac --mode multitrack   # 通常エラーになる
 # Notion 投稿せず結果だけ確認
 uv run pipeline.py recording.flac --skip-notion
 
-# Notion 投稿だけリトライ (Whisper/Claude を再実行しない)
-uv run pipeline.py --post-only \
-  --summary-file    output/2026-05-24.summary.md \
-  --transcript-file output/2026-05-24.transcript.txt \
-  --title "Discord通話 2026-05-24"
+# Notion 投稿だけリトライ (当日の output/yyyy-mm-dd mtg.* を読み直す)
+uv run pipeline.py --post-only
 
 # shebang 経由 (実行ビットを立てた場合)
 chmod +x pipeline.py
@@ -100,19 +99,13 @@ chmod +x pipeline.py
 
 | フラグ | 説明 |
 |---|---|
-| `--title` | Notion ページタイトル (省略時は日時) |
 | `--language` | Whisper 言語コード (既定 `ja`、空文字で自動判定) |
-| `--parent-type` | `page` / `database` (既定 `page`) |
+| `--parent-type {auto,page,database}` | Notion 親種別 (既定: auto = API 自動判定) |
 | `--claude-bin` | `claude` CLI のパス |
 | `--skip-notion` | Notion 投稿をスキップ |
-| `--save-transcript PATH` | 文字起こしをファイル保存 |
-| `--save-summary PATH` | 要約 Markdown をファイル保存 |
 | `--keep-workdir` | 中間ファイルの作業ディレクトリを残す |
 | `--mode {auto,single,multitrack}` | 動作モード強制 (既定: auto) |
-| `--parent-type {auto,page,database}` | Notion 親種別 (既定: auto = API 自動判定) |
-| `--post-only` | Whisper/Claude をスキップして既存ファイルから Notion 投稿のみ |
-| `--summary-file PATH` | `--post-only` 時に読む要約 Markdown |
-| `--transcript-file PATH` | `--post-only` 時に読む文字起こし (任意) |
+| `--post-only` | Whisper/Claude をスキップして当日の `output/yyyy-mm-dd mtg.*` を投稿 |
 | `--property NAME=VALUE` | DB の追加プロパティ。複数回指定可。multi_select は `,` 区切り。例: `--property 'カテゴリー=議事録,定例'` |
 
 ## パイプラインの流れ
