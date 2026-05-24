@@ -85,6 +85,12 @@ uv run pipeline.py input.flac --mode multitrack   # 通常エラーになる
 # Notion 投稿せず結果だけ確認
 uv run pipeline.py recording.flac --skip-notion
 
+# Notion 投稿だけリトライ (Whisper/Claude を再実行しない)
+uv run pipeline.py --post-only \
+  --summary-file    output/2026-05-24.summary.md \
+  --transcript-file output/2026-05-24.transcript.txt \
+  --title "Discord通話 2026-05-24"
+
 # shebang 経由 (実行ビットを立てた場合)
 chmod +x pipeline.py
 ./pipeline.py recording.flac
@@ -103,6 +109,10 @@ chmod +x pipeline.py
 | `--save-summary PATH` | 要約 Markdown をファイル保存 |
 | `--keep-workdir` | 中間ファイルの作業ディレクトリを残す |
 | `--mode {auto,single,multitrack}` | 動作モード強制 (既定: auto) |
+| `--parent-type {auto,page,database}` | Notion 親種別 (既定: auto = API 自動判定) |
+| `--post-only` | Whisper/Claude をスキップして既存ファイルから Notion 投稿のみ |
+| `--summary-file PATH` | `--post-only` 時に読む要約 Markdown |
+| `--transcript-file PATH` | `--post-only` 時に読む文字起こし (任意) |
 
 ## パイプラインの流れ
 

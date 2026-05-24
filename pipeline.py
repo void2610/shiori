@@ -45,7 +45,7 @@ from urllib.parse import urlparse
 import requests
 from dotenv import load_dotenv
 from groq import Groq
-from notion_client import Client as NotionClient
+from notion_client import APIErrorCode, APIResponseError, Client as NotionClient
 
 # スクリプトと同階層の .env を最優先、次にカレントの .env を読む。
 # 既存の環境変数は上書きしない (export 済みの値を尊重)。
@@ -498,6 +498,31 @@ def transcript_blocks(transcript: str) -> list[dict]:
 
 # ---------- 6. Notion へ投稿 ----------
 
+def detect_parent_type(notion: NotionClient, parent_id: str) -> str:
+    """親 ID を Notion に問い合わせて page / database を自動判定する。"""
+    try:
+        notion.databases.retrieve(database_id=parent_id)
+        return "database"
+    except APIResponseError as e:
+        if e.code != APIErrorCode.ObjectNotFound:
+            raise
+    try:
+        notion.pages.retrieve(page_id=parent_id)
+        return "page"
+    except APIResponseError as e:
+        if e.code == APIErrorCode.ObjectNotFound:
+            sys.exit(
+                f"Notion 親 ID {parent_id} にアクセスできません。\n"
+                "以下を確認してください:\n"
+                "  1. ID が正しいか (URL 末尾の 32 桁ハッシュ)\n"
+                "  2. 親ページ / DB を Notion で開き、… → Connections で\n"
+                "     インテグレーション 'shiori' を招待しているか\n"
+                "  3. データベースに投稿したい場合は、ページではなく\n"
+                "     DB そのものにインテグレーションを招待\n"
+            )
+        raise
+
+
 def post_to_notion(
     notion: NotionClient,
     parent_id: str,
@@ -533,14 +558,16 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Craig 録音 → Whisper → Claude Code 要約 → Notion 投稿パイプライン",
     )
-    parser.add_argument("source", help="録音ファイルパス または 直接ダウンロード URL")
+    parser.add_argument("source", nargs="?", default=None,
+                        help="録音ファイルパス または 直接ダウンロード URL "
+                             "(--post-only 時は省略可)")
     parser.add_argument("--title", default=None, help="Notion ページタイトル")
     parser.add_argument("--language", default="ja",
                         help="Whisper 言語コード (空文字で自動判定)")
     parser.add_argument("--parent-type",
-                        choices=["page", "database"],
-                        default=os.environ.get("NOTION_PARENT_TYPE", "page"),
-                        help="NOTION_PARENT_ID が page か database か")
+                        choices=["page", "database", "auto"],
+                        default=os.environ.get("NOTION_PARENT_TYPE", "auto"),
+                        help="親 ID の種別 (既定 auto: API で自動判定)")
     parser.add_argument("--claude-bin",
                         default=os.environ.get("CLAUDE_BIN", "claude"),
                         help="claude CLI の実行パス")
@@ -555,9 +582,41 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--mode", choices=["auto", "single", "multitrack"],
                         default="auto",
                         help="auto: ZIP かつ複数トラックを検出したら multitrack に切替")
+    parser.add_argument("--post-only", action="store_true",
+                        help="Whisper/Claude をスキップし、既存ファイルから Notion 投稿")
+    parser.add_argument("--summary-file", default=None,
+                        help="--post-only 時に読む要約 Markdown ファイル")
+    parser.add_argument("--transcript-file", default=None,
+                        help="--post-only 時に読む文字起こしファイル (任意)")
     args = parser.parse_args(argv)
 
+    if args.post_only:
+        if args.skip_notion:
+            sys.exit("--post-only と --skip-notion は同時指定できません")
+        if not args.summary_file:
+            sys.exit("--post-only には --summary-file が必須です")
+        notion_key = require_env("NOTION_API_KEY")
+        parent_id = require_env("NOTION_PARENT_ID")
+        summary_md = Path(args.summary_file).read_text(encoding="utf-8")
+        transcript = (Path(args.transcript_file).read_text(encoding="utf-8")
+                      if args.transcript_file else "")
+        title = args.title or f"Discord 通話メモ {datetime.now():%Y-%m-%d %H:%M}"
+        notion = NotionClient(auth=notion_key)
+        parent_type = (detect_parent_type(notion, parent_id)
+                       if args.parent_type == "auto" else args.parent_type)
+        log(f"  Notion 親種別: {parent_type}")
+        body = md_to_blocks(summary_md)
+        if transcript:
+            body += transcript_blocks(transcript)
+        url = post_to_notion(notion, parent_id, parent_type, title, body)
+        print(f"Notion に投稿しました: {url}")
+        return 0
+
+    if not args.source:
+        sys.exit("source 引数 (録音ファイル or URL) が必要です")
+
     groq_key = require_env("GROQ_API_KEY")
+    notion_key = parent_id = None
     if not args.skip_notion:
         notion_key = require_env("NOTION_API_KEY")
         parent_id = require_env("NOTION_PARENT_ID")
@@ -615,14 +674,12 @@ def main(argv: Iterable[str] | None = None) -> int:
             return 0
 
         # 5. Notion 投稿
+        notion = NotionClient(auth=notion_key)
+        parent_type = (detect_parent_type(notion, parent_id)
+                       if args.parent_type == "auto" else args.parent_type)
+        log(f"  Notion 親種別: {parent_type}")
         body = md_to_blocks(summary_md) + transcript_blocks(transcript)
-        url = post_to_notion(
-            NotionClient(auth=notion_key),
-            parent_id,
-            args.parent_type,
-            title,
-            body,
-        )
+        url = post_to_notion(notion, parent_id, parent_type, title, body)
         print(f"Notion に投稿しました: {url}")
         return 0
     finally:
