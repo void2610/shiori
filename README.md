@@ -113,6 +113,7 @@ chmod +x pipeline.py
 | `--post-only` | Whisper/Claude をスキップして既存ファイルから Notion 投稿のみ |
 | `--summary-file PATH` | `--post-only` 時に読む要約 Markdown |
 | `--transcript-file PATH` | `--post-only` 時に読む文字起こし (任意) |
+| `--property NAME=VALUE` | DB の追加プロパティ。複数回指定可。multi_select は `,` 区切り。例: `--property 'カテゴリー=議事録,定例'` |
 
 ## パイプラインの流れ
 

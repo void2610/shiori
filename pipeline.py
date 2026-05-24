@@ -540,12 +540,12 @@ def resolve_notion_target(
     token: str,
     parent_id: str,
     parent_type: str,
-) -> tuple[dict, str]:
-    """親 ID を解決し、pages.create 用の parent オブジェクトと title プロパティ名を返す。
+) -> tuple[dict, str, dict]:
+    """親 ID を解決し、(parent, title_prop_name, schema_properties) を返す。
 
     - parent_type=auto: API に問い合わせて DB / Page を自動判定
     - DB の場合: 2025-09-03 仕様で data_sources を辿り data_source_id 親を使う
-    - Page の場合: page_id 親を使う
+    - Page の場合: page_id 親を使う (schema は空 dict)
     """
     if parent_type == "auto":
         try:
@@ -570,7 +570,7 @@ def resolve_notion_target(
                 raise
 
     if parent_type == "page":
-        return {"type": "page_id", "page_id": parent_id}, "title"
+        return {"type": "page_id", "page_id": parent_id}, "title", {}
 
     # parent_type == "database"
     db = _notion_request(token, "GET", f"databases/{parent_id}")
@@ -592,7 +592,7 @@ def resolve_notion_target(
                 f"data_source {ds_id} に title プロパティがありません。"
                 f" 利用可能: {list(props.keys())}"
             )
-        return {"type": "data_source_id", "data_source_id": ds_id}, title_prop
+        return {"type": "data_source_id", "data_source_id": ds_id}, title_prop, props
 
     # 旧形式 DB の互換 (properties が DB レスポンスに直接含まれる)
     props = db.get("properties", {})
@@ -602,7 +602,58 @@ def resolve_notion_target(
             f"DB {parent_id} に title プロパティがありません。"
             f" 利用可能: {list(props.keys())}"
         )
-    return {"type": "database_id", "database_id": parent_id}, title_prop
+    return {"type": "database_id", "database_id": parent_id}, title_prop, props
+
+
+def build_extra_properties(schema: dict, extras: list[str]) -> dict:
+    """--property NAME=VALUE のリストを Notion properties に変換する。
+
+    DB スキーマからプロパティ型を引いて適切な形式に整形する。
+    multi_select は ',' 区切りで複数指定可。
+    """
+    if not extras:
+        return {}
+    if not schema:
+        sys.exit("--property は DB 親 (data_source / database) のときのみ使えます")
+
+    out: dict = {}
+    for spec in extras:
+        if "=" not in spec:
+            sys.exit(f"--property は 'NAME=VALUE' 形式で指定してください: {spec}")
+        name, value = spec.split("=", 1)
+        name, value = name.strip(), value.strip()
+        prop = schema.get(name)
+        if prop is None:
+            sys.exit(
+                f"プロパティ '{name}' が DB に存在しません。"
+                f" 利用可能: {list(schema.keys())}"
+            )
+        ptype = prop.get("type")
+        if ptype == "multi_select":
+            out[name] = {"multi_select": [
+                {"name": v.strip()} for v in value.split(",") if v.strip()
+            ]}
+        elif ptype == "select":
+            out[name] = {"select": {"name": value}}
+        elif ptype == "status":
+            out[name] = {"status": {"name": value}}
+        elif ptype == "rich_text":
+            out[name] = {"rich_text": _rich_text(value)}
+        elif ptype == "number":
+            out[name] = {"number": float(value)}
+        elif ptype == "checkbox":
+            out[name] = {"checkbox": value.lower() in ("true", "1", "yes", "y", "on")}
+        elif ptype == "date":
+            out[name] = {"date": {"start": value}}
+        elif ptype == "url":
+            out[name] = {"url": value}
+        elif ptype == "email":
+            out[name] = {"email": value}
+        elif ptype == "phone_number":
+            out[name] = {"phone_number": value}
+        else:
+            sys.exit(f"プロパティ型 '{ptype}' は未対応です (name={name})")
+    return out
 
 
 def post_to_notion(
@@ -611,11 +662,13 @@ def post_to_notion(
     parent_type: str,
     title: str,
     body_blocks: list[dict],
+    extras: list[str] | None = None,
 ) -> str:
-    parent, title_prop = resolve_notion_target(token, parent_id, parent_type)
+    parent, title_prop, schema = resolve_notion_target(token, parent_id, parent_type)
     log(f"  Notion 親: {parent['type']} = {parent[parent['type']]}")
 
     properties = {title_prop: {"title": _rich_text(title)}}
+    properties.update(build_extra_properties(schema, extras or []))
     page = _notion_request(token, "POST", "pages", {
         "parent": parent,
         "properties": properties,
@@ -666,6 +719,11 @@ def main(argv: Iterable[str] | None = None) -> int:
                         help="--post-only 時に読む要約 Markdown ファイル")
     parser.add_argument("--transcript-file", default=None,
                         help="--post-only 時に読む文字起こしファイル (任意)")
+    parser.add_argument("--property", action="append", default=[], dest="properties",
+                        metavar="NAME=VALUE",
+                        help="DB の追加プロパティ。multi_select は ',' 区切り。"
+                             "例: --property 'カテゴリー=議事録,定例' "
+                             "(複数回指定可)")
     args = parser.parse_args(argv)
 
     if args.post_only:
@@ -682,7 +740,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         body = md_to_blocks(summary_md)
         if transcript:
             body += transcript_blocks(transcript)
-        url = post_to_notion(notion_key, parent_id, args.parent_type, title, body)
+        url = post_to_notion(notion_key, parent_id, args.parent_type, title, body,
+                             extras=args.properties)
         print(f"Notion に投稿しました: {url}")
         return 0
 
@@ -749,7 +808,8 @@ def main(argv: Iterable[str] | None = None) -> int:
 
         # 5. Notion 投稿
         body = md_to_blocks(summary_md) + transcript_blocks(transcript)
-        url = post_to_notion(notion_key, parent_id, args.parent_type, title, body)
+        url = post_to_notion(notion_key, parent_id, args.parent_type, title, body,
+                             extras=args.properties)
         print(f"Notion に投稿しました: {url}")
         return 0
     finally:
