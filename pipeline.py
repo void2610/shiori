@@ -60,6 +60,9 @@ NOTION_BLOCK_BATCH = 100
 NOTION_API_BASE = "https://api.notion.com/v1"
 NOTION_VERSION = "2025-09-03"
 
+# Craig ジョブが「これ以上待っても complete にならない」終端失敗状態。
+CRAIG_TERMINAL_FAILURES = frozenset({"failed", "error", "cancelled"})
+
 # 出力先は固定。タイトル/ファイル名は実行日から自動生成する。
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 
@@ -118,6 +121,19 @@ def log(msg: str) -> None:
 
 # ---------- 1. 録音データの取得 ----------
 
+def _stream_download(url: str, dest: Path, timeout: int = 600) -> int:
+    """URL をローカルパスへストリーミング保存し、書き込んだバイト数を返す。"""
+    written = 0
+    with requests.get(url, stream=True, timeout=timeout) as r:
+        r.raise_for_status()
+        with open(dest, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+                    written += len(chunk)
+    return written
+
+
 def fetch_recording(source: str, workdir: Path) -> Path:
     """ローカルパス または HTTP(S) URL を受け取り、ローカルファイルパスを返す。
 
@@ -131,12 +147,7 @@ def fetch_recording(source: str, workdir: Path) -> Path:
         name = Path(parsed.path).name or "recording.bin"
         dest = workdir / name
         log(f"[1/4] ダウンロード中: {source}")
-        with requests.get(source, stream=True, timeout=600) as r:
-            r.raise_for_status()
-            with open(dest, "wb") as f:
-                for chunk in r.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
+        _stream_download(source, dest)
         return dest
 
     path = Path(source).expanduser().resolve()
@@ -190,9 +201,14 @@ def download_from_craig(parsed, workdir: Path) -> Path:
         return opts.get("format") == "flac" and opts.get("container") == "zip"
 
     job = fetch_job()
+    is_reusable = matches(job) and job.get("status") == "complete"
 
-    if not (matches(job) and job.get("status") == "complete"):
-        if not matches(job):
+    if is_reusable:
+        log(f"  既存ジョブを再利用: {job.get('outputFileName')}")
+    else:
+        if matches(job):
+            log(f"  既存ジョブを継続待ち (status={job.get('status')})")
+        else:
             log("  cook ジョブを作成 (flac multi-track zip)")
             r = requests.post(
                 job_url,
@@ -205,26 +221,21 @@ def download_from_craig(parsed, workdir: Path) -> Path:
             )
             if r.status_code >= 400:
                 sys.exit(f"Craig ジョブ作成失敗 ({r.status_code}): {r.text}")
-        else:
-            log(f"  既存ジョブを継続待ち (status={job.get('status')})")
 
-        # 完了まで polling (録音長に比例)
-        last_status = None
+        last_label = None
         while True:
-            time.sleep(3)
             job = fetch_job()
             status = job.get("status")
             state_type = (job.get("state") or {}).get("type")
             label = f"{status}/{state_type}" if state_type else str(status)
-            if label != last_status:
+            if label != last_label:
                 log(f"    status: {label}")
-                last_status = label
+                last_label = label
             if status == "complete":
                 break
-            if status in ("failed", "error", "cancelled"):
+            if status in CRAIG_TERMINAL_FAILURES:
                 sys.exit(f"Craig ジョブ失敗: {job}")
-    else:
-        log(f"  既存ジョブを再利用: {job.get('outputFileName')}")
+            time.sleep(3)
 
     file_name = job.get("outputFileName")
     if not file_name:
@@ -232,17 +243,13 @@ def download_from_craig(parsed, workdir: Path) -> Path:
 
     file_url = f"{base}/dl/{file_name}"
     dest = workdir / file_name
-    size = job.get("outputSize") or 0
-    log(f"  ダウンロード: {file_url} ({size/1e6:.1f}MB)")
-    downloaded = 0
-    with requests.get(file_url, stream=True, timeout=900) as r:
-        r.raise_for_status()
-        with open(dest, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    f.write(chunk)
-                    downloaded += len(chunk)
-    log(f"  完了: {dest.name} ({downloaded/1e6:.1f}MB)")
+    expected = job.get("outputSize") or 0
+    log(f"  ダウンロード: {file_url} ({expected/1e6:.1f}MB)")
+    written = _stream_download(file_url, dest, timeout=900)
+    # outputSize と乖離していたら破損 ZIP を握ったまま進まないよう早めに失敗させる
+    if expected and written != expected:
+        sys.exit(f"ダウンロードサイズ不一致: {written}B / 期待 {expected}B")
+    log(f"  完了: {dest.name} ({written/1e6:.1f}MB)")
     return dest
 
 
