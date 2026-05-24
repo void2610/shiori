@@ -256,100 +256,52 @@ def extract_tracks(zip_path: Path, workdir: Path) -> list[Track]:
     return tracks
 
 
-def detect_speech_spans(
-    path: Path,
-    noise_db: int = -30,
-    min_silence: float = 0.5,
-    pad: float = 0.2,
-    merge_gap: float = 0.3,
-    min_span: float = 0.5,
-) -> list[tuple[float, float]]:
-    """ffmpeg silencedetect で発話 (非無音) 区間を抽出する。"""
-    proc = subprocess.run(
-        [
-            "ffmpeg", "-hide_banner", "-nostats",
-            "-i", str(path),
-            "-af", f"silencedetect=noise={noise_db}dB:d={min_silence}",
-            "-f", "null", "-",
-        ],
-        capture_output=True, text=True, check=False,
-    )
-    stderr = proc.stderr
-
-    silences: list[tuple[float, float]] = []
-    cur_start: float | None = None
-    for line in stderr.splitlines():
-        if "silence_start" in line:
-            m = re.search(r"silence_start:\s*([\d.]+)", line)
-            if m:
-                cur_start = float(m.group(1))
-        elif "silence_end" in line:
-            m = re.search(r"silence_end:\s*([\d.]+)", line)
-            if m and cur_start is not None:
-                silences.append((cur_start, float(m.group(1))))
-                cur_start = None
-
-    duration = audio_duration_seconds(path)
-    if cur_start is not None:
-        silences.append((cur_start, duration))
-
-    spans: list[tuple[float, float]] = []
-    prev_end = 0.0
-    for s_start, s_end in silences:
-        if s_start > prev_end:
-            spans.append((prev_end, s_start))
-        prev_end = s_end
-    if prev_end < duration:
-        spans.append((prev_end, duration))
-
-    # 隙間が狭い区間をくっつける
-    merged: list[tuple[float, float]] = []
-    for s, e in spans:
-        if merged and s - merged[-1][1] < merge_gap:
-            merged[-1] = (merged[-1][0], e)
-        else:
-            merged.append((s, e))
-
-    # 短すぎる区間を捨て、語頭語尾にパディング
-    out: list[tuple[float, float]] = []
-    for s, e in merged:
-        if e - s < min_span:
-            continue
-        out.append((max(0.0, s - pad), min(duration, e + pad)))
+def _split_with_offsets(audio: Path, workdir: Path) -> list[tuple[Path, float]]:
+    """25MB を超える場合に分割し、(チャンクパス, 開始秒) のリストを返す。"""
+    size = audio.stat().st_size
+    if size <= MAX_CHUNK_BYTES:
+        return [(audio, 0.0)]
+    duration = audio_duration_seconds(audio)
+    chunk_seconds = max(60, int(duration * MAX_CHUNK_BYTES / size) - 5)
+    n = math.ceil(duration / chunk_seconds)
+    log(f"    {size/1e6:.1f}MB あるため {n} 分割 (約 {chunk_seconds}s/chunk)")
+    out: list[tuple[Path, float]] = []
+    for i in range(n):
+        start = i * chunk_seconds
+        chunk = workdir / f"{audio.stem}_part{i:03d}.m4a"
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-ss", str(start), "-t", str(chunk_seconds),
+                "-i", str(audio),
+                "-c", "copy",
+                str(chunk),
+            ],
+            check=True,
+        )
+        out.append((chunk, float(start)))
     return out
 
 
-def extract_clip(src: Path, start: float, end: float, out: Path) -> None:
-    """指定区間を切り出す (再エンコードで端を正確に)。"""
-    subprocess.run(
-        [
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-            "-i", str(src),
-            "-ss", f"{start:.3f}", "-to", f"{end:.3f}",
-            "-c:a", "aac", "-b:a", "64k",
-            str(out),
-        ],
-        check=True,
-    )
-
-
-def transcribe_segments(
-    audio: Path,
-    spans: list[tuple[float, float]],
-    speaker: str,
+def transcribe_track_verbose(
+    track: Track,
     groq: Groq,
     language: str | None,
     workdir: Path,
+    no_speech_threshold: float = 0.6,
 ) -> list[Segment]:
-    """発話区間ごとに verbose_json で文字起こしして Segment 列を返す。"""
+    """トラックを丸ごと Whisper に投げ、verbose_json のセグメントを Segment 列に変換。"""
+    audio = to_whisper_friendly(track.source_path, workdir)
+    chunks = _split_with_offsets(audio, workdir)
+
     segments: list[Segment] = []
-    for i, (s, e) in enumerate(spans):
-        clip = workdir / f"{speaker}_clip_{i:04d}.m4a"
-        extract_clip(audio, s, e, clip)
-        with open(clip, "rb") as f:
+    for i, (chunk, offset) in enumerate(chunks, 1):
+        log(f"    - {track.speaker}: チャンク {i}/{len(chunks)} を Whisper に送信中"
+            f" ({chunk.stat().st_size/1e6:.1f}MB)")
+        with open(chunk, "rb") as f:
             data = f.read()
         params: dict = {
-            "file": (clip.name, data, "audio/m4a"),
+            "file": (chunk.name, data, "audio/m4a"),
             "model": WHISPER_MODEL,
             "response_format": "verbose_json",
             "temperature": 0,
@@ -359,23 +311,24 @@ def transcribe_segments(
         result = groq.audio.transcriptions.create(**params)
 
         sub_segments = _attr(result, "segments") or []
-        if sub_segments:
-            for seg in sub_segments:
-                text = (_attr(seg, "text") or "").strip()
-                if not text:
-                    continue
-                segments.append(Segment(
-                    start=float(_attr(seg, "start", 0.0)) + s,
-                    end=float(_attr(seg, "end", e - s)) + s,
-                    speaker=speaker,
-                    text=text,
-                ))
-        else:
-            # segments が空でも text 全体は取れることがある
-            full = (_attr(result, "text") or "").strip()
-            if full:
-                segments.append(Segment(start=s, end=e, speaker=speaker, text=full))
-        clip.unlink(missing_ok=True)
+        kept = 0
+        for seg in sub_segments:
+            text = (_attr(seg, "text") or "").strip()
+            if not text:
+                continue
+            # マルチトラックは「自分が喋っていない時間」が長いので
+            # no_speech_prob が高いセグメントは捨てる (幻聴対策)
+            no_speech = _attr(seg, "no_speech_prob")
+            if no_speech is not None and float(no_speech) > no_speech_threshold:
+                continue
+            segments.append(Segment(
+                start=float(_attr(seg, "start", 0.0)) + offset,
+                end=float(_attr(seg, "end", 0.0)) + offset,
+                speaker=track.speaker,
+                text=text,
+            ))
+            kept += 1
+        log(f"      → セグメント {kept}/{len(sub_segments)} 採用")
     return segments
 
 
@@ -395,20 +348,18 @@ def format_transcript(segments: list[Segment]) -> str:
 
 
 def run_multitrack(zip_path: Path, groq: Groq, language: str | None, workdir: Path) -> str:
-    """マルチトラック ZIP を話者付き文字起こし文字列に変換する。"""
+    """マルチトラック ZIP を話者付き文字起こし文字列に変換する。
+
+    各トラックを丸ごと Whisper の verbose_json に投げ、返ってきたセグメントを
+    話者付き Segment に変換してから時系列マージする。no_speech_prob で無音区間の
+    幻聴をフィルタする。
+    """
     tracks = extract_tracks(zip_path, workdir)
     all_segments: list[Segment] = []
     for t in tracks:
-        log(f"  - トラック {t.index} ({t.speaker}) を処理中...")
-        audio = to_whisper_friendly(t.source_path, workdir)
-        t.audio_path = audio
-        spans = detect_speech_spans(audio)
-        if not spans:
-            log(f"    発話区間なし、スキップ")
-            continue
-        log(f"    発話区間 {len(spans)} 個 → Whisper")
-        segs = transcribe_segments(audio, spans, t.speaker, groq, language, workdir)
-        log(f"    セグメント {len(segs)} 個取得")
+        log(f"  - トラック {t.index} ({t.speaker}) を処理中")
+        segs = transcribe_track_verbose(t, groq, language, workdir)
+        log(f"    トラック合計 {len(segs)} セグメント")
         all_segments.extend(segs)
     if not all_segments:
         sys.exit("どのトラックからも発話を検出できませんでした")

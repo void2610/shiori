@@ -42,7 +42,7 @@ NOTION_PARENT_ID=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 | 入力 | モード | 話者分離 | コスト |
 |---|---|---|---|
 | `.flac` / `.m4a` 等 単一音声 (mix) | single | なし | 1 トラック分 |
-| **Craig マルチトラック ZIP** | multitrack | あり (`話者: 発言`) | トラック数ぶん × 発話区間のみ |
+| **Craig マルチトラック ZIP** | multitrack | あり (`話者: 発言`) | トラック数 × 録音長 |
 
 録音ファイルは `input/` に置き、文字起こし/要約を保存したい場合は `output/` を使う運用を推奨 (中身は `.gitignore` 済み)。
 
@@ -57,7 +57,11 @@ uv run pipeline.py input/craig-xxx.flac \
 
 ### multitrack モード (推奨: 話者付き議事録)
 
-Craig のダウンロードページから **multi-track ZIP** をそのまま渡します。トラック名 (`1-shuya.flac` 等) から話者名を取得し、各トラックの発話区間だけを `silencedetect` で抜き出して Whisper に送るので、無音は課金されません。
+Craig のダウンロードページから **multi-track ZIP** をそのまま渡します。トラック名 (`1-shuya.flac` 等) から話者名を取得し、**各トラックを丸ごと Whisper の `verbose_json` に投げてセグメント単位のタイムスタンプを取得**します。
+
+- リクエスト数 = トラック数 (25MB を超えるトラックだけ時間分割)
+- Groq の **20 RPM 制限**と**最低 10 秒課金**にひっかからない
+- Whisper が返す `no_speech_prob > 0.6` のセグメントを捨てて無音区間の幻聴を抑制
 
 ```bash
 uv run pipeline.py input/craig-xxx.zip --title "週次定例"
@@ -112,7 +116,7 @@ chmod +x pipeline.py
 ### multitrack モード
 1. **取得**: 上と同じ。
 2. **展開**: ZIP を解凍し、`1-<speaker>.flac` 形式から (index, 話者名, 音声パス) のトラックを抽出。
-3. **発話区間検出**: 各トラックを 16kHz/mono に変換し、`ffmpeg silencedetect` で発話 (非無音) 区間を抽出。短い隙間は結合、語頭語尾に 0.2s パディング。
-4. **チャンク文字起こし**: 各発話区間だけを切り出して Groq Whisper の `verbose_json` に投入。返ってきたセグメントの `start/end` に区間オフセットを加算し、録音開始からの絶対秒に正規化。
+3. **変換**: 各トラックを 16kHz/mono/AAC 64kbps に圧縮。25MB を超えるトラックだけ時間分割。
+4. **トラック単位の文字起こし**: 各チャンクを Groq Whisper の `verbose_json` に投入し、セグメント (`start/end/text/no_speech_prob`) を取得。`no_speech_prob > 0.6` のセグメントは捨てる (相手が喋っているだけの無音区間で発生しがちな幻聴を除去)。チャンク開始秒を `start/end` に加算して録音開始からの絶対秒に正規化。
 5. **時系列マージ**: 全話者のセグメントを `start` でソートし、`[hh:mm:ss] 話者: 発言` 形式の文字起こしを生成。
 6. **要約 / 投稿**: single と同じ。Claude には「話者ラベル付き」を明示するプロンプトを渡し、議事録の担当者特定に活用させる。
