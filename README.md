@@ -61,7 +61,13 @@ uv run pipeline.py input/craig-xxx.flac
 
 ### multitrack モード (推奨: 話者付き議事録)
 
-Craig のダウンロードページから **multi-track ZIP** をそのまま渡します。トラック名 (`1-shuya.flac` 等) から話者名を取得し、**各トラックを丸ごと Whisper の `verbose_json` に投げてセグメント単位のタイムスタンプを取得**します。
+Craig の共有 URL (`https://craig.horse/rec/<id>?key=<key>`) を直接渡せば cook → multi-track FLAC ZIP の取得まで自動でやります:
+
+```bash
+uv run pipeline.py "https://craig.horse/rec/bZvlP9mrDcvU?key=55bRwv"
+```
+
+トラック名 (`1-shuya.flac` 等) から話者名を取得し、**各トラックを丸ごと Whisper の `verbose_json` に投げてセグメント単位のタイムスタンプを取得**します。
 
 - リクエスト数 = トラック数 (25MB を超えるトラックだけ時間分割)
 - Groq の **20 RPM 制限**と**最低 10 秒課金**にひっかからない

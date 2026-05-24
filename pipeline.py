@@ -39,7 +39,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import requests
 from dotenv import load_dotenv
@@ -118,9 +118,16 @@ def log(msg: str) -> None:
 # ---------- 1. 録音データの取得 ----------
 
 def fetch_recording(source: str, workdir: Path) -> Path:
-    """ローカルパス または HTTP(S) URL を受け取り、ローカルファイルパスを返す。"""
+    """ローカルパス または HTTP(S) URL を受け取り、ローカルファイルパスを返す。
+
+    Craig のダウンロードページ URL (`https://craig.{horse,chat}/rec/<id>?key=<key>`)
+    なら、cook API 経由でマルチトラック FLAC ZIP を自動取得する。
+    """
     if source.startswith(("http://", "https://")):
-        name = Path(urlparse(source).path).name or "recording.bin"
+        parsed = urlparse(source)
+        if _looks_like_craig_share(parsed):
+            return download_from_craig(parsed, workdir)
+        name = Path(parsed.path).name or "recording.bin"
         dest = workdir / name
         log(f"[1/4] ダウンロード中: {source}")
         with requests.get(source, stream=True, timeout=600) as r:
@@ -136,6 +143,77 @@ def fetch_recording(source: str, workdir: Path) -> Path:
         sys.exit(f"録音ファイルが見つかりません: {path}")
     log(f"[1/4] ローカル録音を使用: {path}")
     return path
+
+
+def _looks_like_craig_share(parsed) -> bool:
+    """https://craig.{horse,chat}/rec/<id>?key=<key> 形式か判定。"""
+    if "craig" not in parsed.netloc:
+        return False
+    parts = parsed.path.strip("/").split("/")
+    return len(parts) >= 2 and parts[0] == "rec"
+
+
+def download_from_craig(parsed, workdir: Path) -> Path:
+    """Craig の共有 URL から multi-track FLAC ZIP を取得する。
+
+    フロー:
+      1. GET /api/recording/{id}/cook?key=... で既に cook 済みかチェック
+      2. 未cook ならばまず POST /api/recording/{id}/cook で同期的に cook 実行
+         (Craig 側で ffmpeg 処理が走るので録音長に比例した待ち時間)
+      3. GET cook で {download.file} を取得
+      4. /dl/{download.file} から ZIP をストリーミングダウンロード
+    """
+    parts = parsed.path.strip("/").split("/")
+    rec_id = parts[1]
+    key = parse_qs(parsed.query).get("key", [""])[0]
+    if not key:
+        sys.exit(f"Craig URL にクエリパラメータ 'key' がありません: {parsed.geturl()}")
+
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    cook_url = f"{base}/api/recording/{rec_id}/cook?key={key}"
+
+    log(f"[1/4] Craig {rec_id} を取得します")
+
+    # 1. 既存 cook を確認 (同じ format/container なら再利用)
+    state = requests.get(cook_url, timeout=60).json()
+    download = state.get("download") if state.get("ready") else None
+    if (
+        download
+        and download.get("format") == "flac"
+        and download.get("container") == "zip"
+    ):
+        log(f"  既存の cook を再利用: {download['file']}")
+    else:
+        # 2. cook を起動 (Craig 側で処理が完了するまで POST がブロックする)
+        log("  cook を実行中 (録音長によっては数分かかります)...")
+        r = requests.post(
+            cook_url,
+            json={"format": "flac", "container": "zip", "dynaudnorm": False},
+            timeout=1800,
+        )
+        if r.status_code >= 400:
+            sys.exit(f"Craig cook 失敗 ({r.status_code}): {r.text}")
+
+        # 3. 完了後の状態を取得
+        state = requests.get(cook_url, timeout=60).json()
+        download = state.get("download")
+        if not download or not download.get("file"):
+            sys.exit(f"Craig cook 後に download.file がありません: {state}")
+
+    # 4. 実ファイルダウンロード
+    file_url = f"{base}/dl/{download['file']}"
+    dest = workdir / f"craig_{rec_id}.flac.zip"
+    log(f"  ダウンロード: {file_url}")
+    downloaded = 0
+    with requests.get(file_url, stream=True, timeout=900) as r:
+        r.raise_for_status()
+        with open(dest, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+                    downloaded += len(chunk)
+    log(f"  完了: {dest.name} ({downloaded/1e6:.1f}MB)")
+    return dest
 
 
 # ---------- 2. 音声を Whisper 向けに整形 ----------
