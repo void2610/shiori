@@ -55,7 +55,7 @@ uv run pipeline.py input/craig-xxx.flac
 出力先 / Notion タイトルは実行日から自動決定:
 - `output/yyyy-mm-dd.transcript.txt`
 - `output/yyyy-mm-dd.summary.md`
-- Notion ページタイトル: `yyyy-mm-dd`
+- Notion ページタイトル: `yyyy-mm-dd mtg`
 
 ### multitrack モード (推奨: 話者付き議事録)
 

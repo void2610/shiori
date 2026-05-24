@@ -65,11 +65,11 @@ OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 
 def today_artifacts() -> tuple[str, Path, Path]:
     """(title, transcript_path, summary_path) を実行日から生成して返す。"""
-    base = f"{datetime.now():%Y-%m-%d}"
+    date = f"{datetime.now():%Y-%m-%d}"
     return (
-        base,
-        OUTPUT_DIR / f"{base}.transcript.txt",
-        OUTPUT_DIR / f"{base}.summary.md",
+        f"{date} mtg",
+        OUTPUT_DIR / f"{date}.transcript.txt",
+        OUTPUT_DIR / f"{date}.summary.md",
     )
 
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "whisper-large-v3")
