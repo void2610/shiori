@@ -9,8 +9,8 @@ from urllib.parse import ParseResult, parse_qs, urlparse
 
 import requests
 
-from .config import CRAIG_TERMINAL_FAILURES
-from .util import log, stream_download
+from config import CRAIG_TERMINAL_FAILURES
+from util import log, stream_download
 
 
 def fetch_recording(source: str, workdir: Path) -> Path:

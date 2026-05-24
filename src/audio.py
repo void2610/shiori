@@ -9,8 +9,8 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from .config import MAX_CHUNK_BYTES, TRACK_NAME_RE
-from .util import log
+from config import MAX_CHUNK_BYTES, TRACK_NAME_RE
+from util import log
 
 
 @dataclass

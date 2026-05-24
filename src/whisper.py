@@ -8,14 +8,14 @@ from pathlib import Path
 
 from groq import Groq
 
-from .audio import (
+from audio import (
     Track,
     extract_tracks,
     split_with_offsets,
     to_whisper_friendly,
 )
-from .config import WHISPER_MODEL
-from .util import log
+from config import WHISPER_MODEL
+from util import log
 
 
 @dataclass

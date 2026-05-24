@@ -6,13 +6,13 @@ import sys
 
 import requests
 
-from .config import (
+from config import (
     NOTION_API_BASE,
     NOTION_BLOCK_BATCH,
     NOTION_TEXT_CHUNK,
     NOTION_VERSION,
 )
-from .util import log
+from util import log
 
 
 class NotionError(RuntimeError):

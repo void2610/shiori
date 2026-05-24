@@ -21,17 +21,14 @@ Craig (録音) ─► Groq Whisper (文字起こし) ─► Claude Code (要約)
 pyproject.toml
 uv.lock
 src/
-  shiori/
-    __init__.py
-    __main__.py      # python -m shiori 用
-    cli.py           # argparse + main
-    config.py        # .env ロード、定数、出力ファイル名生成
-    util.py          # log / require_env / stream_download
-    recording.py     # ローカル / 直接URL / Craig 共有URL 取得
-    audio.py         # ffmpeg ラッパ + ZIP 解析 (Track)
-    whisper.py       # Groq Whisper + マルチトラック合成 (Segment)
-    summarize.py     # Claude Code 呼び出し + プロンプト
-    notion.py        # Notion API + Markdown→blocks 変換
+  cli.py             # argparse + main
+  config.py          # .env ロード、定数、出力ファイル名生成
+  util.py            # log / require_env / stream_download
+  recording.py       # ローカル / 直接URL / Craig 共有URL 取得
+  audio.py           # ffmpeg ラッパ + ZIP 解析 (Track)
+  whisper.py         # Groq Whisper + マルチトラック合成 (Segment)
+  summarize.py       # Claude Code 呼び出し + プロンプト
+  notion.py          # Notion API + Markdown→blocks 変換
 ```
 
 ## セットアップ
@@ -114,8 +111,8 @@ uv run shiori --post-only
 # DB のカテゴリープロパティを付ける
 uv run shiori --post-only --property 'カテゴリー=議事録'
 
-# python -m でも呼べる
-uv run python -m shiori input.zip
+# python 直接呼び出しでも動く
+uv run python src/cli.py input.zip
 ```
 
 ## オプション

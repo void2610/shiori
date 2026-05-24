@@ -12,18 +12,18 @@ from typing import Iterable
 
 from groq import Groq
 
-from .audio import is_multitrack_source, split_if_large, to_whisper_friendly
-from .config import (
+from audio import is_multitrack_source, split_if_large, to_whisper_friendly
+from config import (
     OUTPUT_DIR,
     WHISPER_MODEL,
     latest_today_artifacts,
     today_artifacts,
 )
-from .notion import md_to_blocks, post_to_notion, transcript_blocks
-from .recording import fetch_recording
-from .summarize import summarize_with_claude
-from .util import log, require_env
-from .whisper import run_multitrack, transcribe_all
+from notion import md_to_blocks, post_to_notion, transcript_blocks
+from recording import fetch_recording
+from summarize import summarize_with_claude
+from util import log, require_env
+from whisper import run_multitrack, transcribe_all
 
 
 def _build_parser() -> argparse.ArgumentParser:

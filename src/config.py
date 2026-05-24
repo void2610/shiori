@@ -14,8 +14,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-# config.py の場所は <root>/src/shiori/config.py なので parents[2] がプロジェクトルート。
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+# config.py は <root>/src/config.py なので parent.parent がプロジェクトルート。
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 load_dotenv(PROJECT_ROOT / ".env", override=False)
 load_dotenv(override=False)
