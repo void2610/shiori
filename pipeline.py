@@ -34,6 +34,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime
@@ -154,14 +155,17 @@ def _looks_like_craig_share(parsed) -> bool:
 
 
 def download_from_craig(parsed, workdir: Path) -> Path:
-    """Craig の共有 URL から multi-track FLAC ZIP を取得する。
+    """Craig (craig.horse / craig.chat) の共有 URL から multi-track FLAC ZIP を取得。
 
-    フロー:
-      1. GET /api/recording/{id}/cook?key=... で既に cook 済みかチェック
-      2. 未cook ならばまず POST /api/recording/{id}/cook で同期的に cook 実行
-         (Craig 側で ffmpeg 処理が走るので録音長に比例した待ち時間)
-      3. GET cook で {download.file} を取得
-      4. /dl/{download.file} から ZIP をストリーミングダウンロード
+    エンドポイント (craig.horse, v1 API):
+      GET    /api/v1/recordings/{id}/job?key=...  ジョブ状態
+      POST   /api/v1/recordings/{id}/job?key=...  ジョブ作成 (body は下記)
+      GET    /dl/{outputFileName}                 cook 済みファイル本体
+
+    POST ボディ:
+      {"type": "recording", "options": {"format": "flac", "container": "zip"}}
+
+    既存ジョブが flac.zip かつ status=complete なら再利用。
     """
     parts = parsed.path.strip("/").split("/")
     rec_id = parts[1]
@@ -170,40 +174,66 @@ def download_from_craig(parsed, workdir: Path) -> Path:
         sys.exit(f"Craig URL にクエリパラメータ 'key' がありません: {parsed.geturl()}")
 
     base = f"{parsed.scheme}://{parsed.netloc}"
-    cook_url = f"{base}/api/recording/{rec_id}/cook?key={key}"
+    job_url = f"{base}/api/v1/recordings/{rec_id}/job?key={key}"
 
     log(f"[1/4] Craig {rec_id} を取得します")
 
-    # 1. 既存 cook を確認 (同じ format/container なら再利用)
-    state = requests.get(cook_url, timeout=60).json()
-    download = state.get("download") if state.get("ready") else None
-    if (
-        download
-        and download.get("format") == "flac"
-        and download.get("container") == "zip"
-    ):
-        log(f"  既存の cook を再利用: {download['file']}")
+    def fetch_job() -> dict:
+        r = requests.get(job_url, timeout=60)
+        r.raise_for_status()
+        return (r.json() or {}).get("job") or {}
+
+    def matches(job: dict) -> bool:
+        if not job or job.get("type") != "recording":
+            return False
+        opts = job.get("options") or {}
+        return opts.get("format") == "flac" and opts.get("container") == "zip"
+
+    job = fetch_job()
+
+    if not (matches(job) and job.get("status") == "complete"):
+        if not matches(job):
+            log("  cook ジョブを作成 (flac multi-track zip)")
+            r = requests.post(
+                job_url,
+                json={
+                    "type": "recording",
+                    "options": {"format": "flac", "container": "zip"},
+                },
+                headers={"Content-Type": "application/json"},
+                timeout=60,
+            )
+            if r.status_code >= 400:
+                sys.exit(f"Craig ジョブ作成失敗 ({r.status_code}): {r.text}")
+        else:
+            log(f"  既存ジョブを継続待ち (status={job.get('status')})")
+
+        # 完了まで polling (録音長に比例)
+        last_status = None
+        while True:
+            time.sleep(3)
+            job = fetch_job()
+            status = job.get("status")
+            state_type = (job.get("state") or {}).get("type")
+            label = f"{status}/{state_type}" if state_type else str(status)
+            if label != last_status:
+                log(f"    status: {label}")
+                last_status = label
+            if status == "complete":
+                break
+            if status in ("failed", "error", "cancelled"):
+                sys.exit(f"Craig ジョブ失敗: {job}")
     else:
-        # 2. cook を起動 (Craig 側で処理が完了するまで POST がブロックする)
-        log("  cook を実行中 (録音長によっては数分かかります)...")
-        r = requests.post(
-            cook_url,
-            json={"format": "flac", "container": "zip", "dynaudnorm": False},
-            timeout=1800,
-        )
-        if r.status_code >= 400:
-            sys.exit(f"Craig cook 失敗 ({r.status_code}): {r.text}")
+        log(f"  既存ジョブを再利用: {job.get('outputFileName')}")
 
-        # 3. 完了後の状態を取得
-        state = requests.get(cook_url, timeout=60).json()
-        download = state.get("download")
-        if not download or not download.get("file"):
-            sys.exit(f"Craig cook 後に download.file がありません: {state}")
+    file_name = job.get("outputFileName")
+    if not file_name:
+        sys.exit(f"outputFileName がありません: {job}")
 
-    # 4. 実ファイルダウンロード
-    file_url = f"{base}/dl/{download['file']}"
-    dest = workdir / f"craig_{rec_id}.flac.zip"
-    log(f"  ダウンロード: {file_url}")
+    file_url = f"{base}/dl/{file_name}"
+    dest = workdir / file_name
+    size = job.get("outputSize") or 0
+    log(f"  ダウンロード: {file_url} ({size/1e6:.1f}MB)")
     downloaded = 0
     with requests.get(file_url, stream=True, timeout=900) as r:
         r.raise_for_status()
