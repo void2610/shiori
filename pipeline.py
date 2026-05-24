@@ -527,6 +527,24 @@ def _database_title_prop(notion: NotionClient, database_id: str) -> str:
     """DB のタイトル列名は任意 (Name / 名前 / Title 等) なのでスキーマから取得。"""
     db = notion.databases.retrieve(database_id=database_id)
     props = db.get("properties", {})
+    if not props:
+        # Notion の 2025-09+ Data Source 形式では properties は別エンドポイント。
+        # 現状の notion-client はこの形式への直接投稿に未対応。
+        data_sources = db.get("data_sources") or []
+        msg = (
+            f"データベース {database_id} の properties を取得できませんでした。\n"
+            "原因として最も多いのは Notion の 2025-09 以降の Data Source 形式 DB です\n"
+            "(notion-client の現バージョンは未対応)。\n"
+            "\n対処 (推奨): 親をふつうのページに変更してください\n"
+            "  1. Notion で新規ページを作成 (タイトル例: '通話メモ')\n"
+            "  2. そのページの右上 … → Connections で 'shiori' を招待\n"
+            "  3. .env の NOTION_PARENT_ID をそのページの URL 末尾 32 桁に置換\n"
+            "  4. NOTION_PARENT_TYPE は削除 (auto で動きます)\n"
+        )
+        if data_sources:
+            ds_ids = [ds.get("id") for ds in data_sources]
+            msg += f"\n参考: 検出された data_sources: {ds_ids}\n"
+        sys.exit(msg)
     for name, prop in props.items():
         if prop.get("type") == "title":
             return name
