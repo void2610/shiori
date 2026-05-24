@@ -18,4 +18,4 @@ dependencies = [
 shiori = "shiori.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["shiori"]
+packages = ["src/shiori"]
