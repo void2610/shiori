@@ -30,10 +30,13 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import zipfile
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
@@ -56,6 +59,14 @@ NOTION_TEXT_CHUNK = 1900
 NOTION_BLOCK_BATCH = 100
 
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "whisper-large-v3")
+
+# マルチトラック処理で対応する音声拡張子
+TRACK_EXTS = (".flac", ".ogg", ".opus", ".aac", ".m4a", ".wav", ".mp3")
+# Craig 形式のトラックファイル名: "1-username.flac" など (末尾に _userid が付くこともある)
+TRACK_NAME_RE = re.compile(
+    r"^(?P<idx>\d+)-(?P<name>.+?)(?:_\d{6,})?(?P<ext>\.(?:flac|ogg|opus|aac|m4a|wav|mp3))$",
+    re.IGNORECASE,
+)
 
 
 # ---------- 共通ユーティリティ ----------
@@ -181,22 +192,248 @@ def transcribe_all(chunks: list[Path], groq: Groq, language: str | None) -> str:
     return "\n".join(transcripts).strip()
 
 
+# ---------- 3b. マルチトラック処理 ----------
+
+@dataclass
+class Track:
+    index: int
+    speaker: str
+    source_path: Path  # ZIP から展開した元ファイル
+    audio_path: Path | None = None  # to_whisper_friendly 後のパス
+
+
+@dataclass
+class Segment:
+    start: float  # 録音開始からの絶対秒
+    end: float
+    speaker: str
+    text: str
+
+
+def _attr(obj, key, default=None):
+    """SDK レスポンスが dict でも Pydantic モデルでもアクセスできるよう吸収。"""
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def is_multitrack_source(path: Path) -> bool:
+    """ZIP 内に Craig 命名規則のトラックが 2 個以上あればマルチトラック。"""
+    if path.suffix.lower() != ".zip":
+        return False
+    try:
+        with zipfile.ZipFile(path) as zf:
+            tracks = [n for n in zf.namelist() if TRACK_NAME_RE.match(Path(n).name)]
+        return len(tracks) >= 2
+    except zipfile.BadZipFile:
+        return False
+
+
+def extract_tracks(zip_path: Path, workdir: Path) -> list[Track]:
+    """ZIP を展開して Craig トラック群を Track のリストとして返す。"""
+    extract_dir = workdir / "tracks"
+    extract_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path) as zf:
+        zf.extractall(extract_dir)
+
+    tracks: list[Track] = []
+    for p in sorted(extract_dir.rglob("*")):
+        if not p.is_file():
+            continue
+        m = TRACK_NAME_RE.match(p.name)
+        if not m:
+            continue
+        tracks.append(Track(
+            index=int(m.group("idx")),
+            speaker=m.group("name"),
+            source_path=p,
+        ))
+
+    if not tracks:
+        sys.exit(f"ZIP からマルチトラックを検出できませんでした: {zip_path}")
+    tracks.sort(key=lambda t: t.index)
+    log(f"  検出トラック: {', '.join(f'{t.index}={t.speaker}' for t in tracks)}")
+    return tracks
+
+
+def detect_speech_spans(
+    path: Path,
+    noise_db: int = -30,
+    min_silence: float = 0.5,
+    pad: float = 0.2,
+    merge_gap: float = 0.3,
+    min_span: float = 0.5,
+) -> list[tuple[float, float]]:
+    """ffmpeg silencedetect で発話 (非無音) 区間を抽出する。"""
+    proc = subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-nostats",
+            "-i", str(path),
+            "-af", f"silencedetect=noise={noise_db}dB:d={min_silence}",
+            "-f", "null", "-",
+        ],
+        capture_output=True, text=True, check=False,
+    )
+    stderr = proc.stderr
+
+    silences: list[tuple[float, float]] = []
+    cur_start: float | None = None
+    for line in stderr.splitlines():
+        if "silence_start" in line:
+            m = re.search(r"silence_start:\s*([\d.]+)", line)
+            if m:
+                cur_start = float(m.group(1))
+        elif "silence_end" in line:
+            m = re.search(r"silence_end:\s*([\d.]+)", line)
+            if m and cur_start is not None:
+                silences.append((cur_start, float(m.group(1))))
+                cur_start = None
+
+    duration = audio_duration_seconds(path)
+    if cur_start is not None:
+        silences.append((cur_start, duration))
+
+    spans: list[tuple[float, float]] = []
+    prev_end = 0.0
+    for s_start, s_end in silences:
+        if s_start > prev_end:
+            spans.append((prev_end, s_start))
+        prev_end = s_end
+    if prev_end < duration:
+        spans.append((prev_end, duration))
+
+    # 隙間が狭い区間をくっつける
+    merged: list[tuple[float, float]] = []
+    for s, e in spans:
+        if merged and s - merged[-1][1] < merge_gap:
+            merged[-1] = (merged[-1][0], e)
+        else:
+            merged.append((s, e))
+
+    # 短すぎる区間を捨て、語頭語尾にパディング
+    out: list[tuple[float, float]] = []
+    for s, e in merged:
+        if e - s < min_span:
+            continue
+        out.append((max(0.0, s - pad), min(duration, e + pad)))
+    return out
+
+
+def extract_clip(src: Path, start: float, end: float, out: Path) -> None:
+    """指定区間を切り出す (再エンコードで端を正確に)。"""
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", str(src),
+            "-ss", f"{start:.3f}", "-to", f"{end:.3f}",
+            "-c:a", "aac", "-b:a", "64k",
+            str(out),
+        ],
+        check=True,
+    )
+
+
+def transcribe_segments(
+    audio: Path,
+    spans: list[tuple[float, float]],
+    speaker: str,
+    groq: Groq,
+    language: str | None,
+    workdir: Path,
+) -> list[Segment]:
+    """発話区間ごとに verbose_json で文字起こしして Segment 列を返す。"""
+    segments: list[Segment] = []
+    for i, (s, e) in enumerate(spans):
+        clip = workdir / f"{speaker}_clip_{i:04d}.m4a"
+        extract_clip(audio, s, e, clip)
+        with open(clip, "rb") as f:
+            data = f.read()
+        params: dict = {
+            "file": (clip.name, data, "audio/m4a"),
+            "model": WHISPER_MODEL,
+            "response_format": "verbose_json",
+            "temperature": 0,
+        }
+        if language:
+            params["language"] = language
+        result = groq.audio.transcriptions.create(**params)
+
+        sub_segments = _attr(result, "segments") or []
+        if sub_segments:
+            for seg in sub_segments:
+                text = (_attr(seg, "text") or "").strip()
+                if not text:
+                    continue
+                segments.append(Segment(
+                    start=float(_attr(seg, "start", 0.0)) + s,
+                    end=float(_attr(seg, "end", e - s)) + s,
+                    speaker=speaker,
+                    text=text,
+                ))
+        else:
+            # segments が空でも text 全体は取れることがある
+            full = (_attr(result, "text") or "").strip()
+            if full:
+                segments.append(Segment(start=s, end=e, speaker=speaker, text=full))
+        clip.unlink(missing_ok=True)
+    return segments
+
+
+def format_timestamp(seconds: float) -> str:
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+def format_transcript(segments: list[Segment]) -> str:
+    segments.sort(key=lambda x: x.start)
+    return "\n".join(
+        f"[{format_timestamp(seg.start)}] {seg.speaker}: {seg.text}"
+        for seg in segments
+    )
+
+
+def run_multitrack(zip_path: Path, groq: Groq, language: str | None, workdir: Path) -> str:
+    """マルチトラック ZIP を話者付き文字起こし文字列に変換する。"""
+    tracks = extract_tracks(zip_path, workdir)
+    all_segments: list[Segment] = []
+    for t in tracks:
+        log(f"  - トラック {t.index} ({t.speaker}) を処理中...")
+        audio = to_whisper_friendly(t.source_path, workdir)
+        t.audio_path = audio
+        spans = detect_speech_spans(audio)
+        if not spans:
+            log(f"    発話区間なし、スキップ")
+            continue
+        log(f"    発話区間 {len(spans)} 個 → Whisper")
+        segs = transcribe_segments(audio, spans, t.speaker, groq, language, workdir)
+        log(f"    セグメント {len(segs)} 個取得")
+        all_segments.extend(segs)
+    if not all_segments:
+        sys.exit("どのトラックからも発話を検出できませんでした")
+    return format_transcript(all_segments)
+
+
 # ---------- 4. Claude Code で要約 ----------
 
 SUMMARY_PROMPT_TEMPLATE = """以下は Discord で行われた通話の文字起こしです。日本語で読みやすい議事録 (Markdown) に整形してください。
+
+# 入力フォーマット
+{format_note}
 
 # 出力フォーマット
 ## 概要
 - 通話全体を 3〜5 行で要約
 
 ## 主な議題
-- 議題ごとに見出しを設けず、箇条書きで「議論内容 / 結論 / 補足」をまとめる
+- 議題ごとに見出しを設けず、箇条書きで「議論内容 / 結論 / 補足」をまとめる{speaker_hint_topic}
 
 ## 決定事項
 - 箇条書き。決まったことだけを簡潔に
 
 ## ToDo / ネクストアクション
-- [ ] 担当者: 内容 (期限が明示されていれば末尾に「(〜まで)」)
+- [ ] 担当者: 内容 (期限が明示されていれば末尾に「(〜まで)」){speaker_hint_todo}
 
 ## 未解決の論点
 - 箇条書き。なければ「なし」と書く
@@ -211,8 +448,24 @@ SUMMARY_PROMPT_TEMPLATE = """以下は Discord で行われた通話の文字起
 """
 
 
-def summarize_with_claude(transcript: str, claude_bin: str) -> str:
-    prompt = SUMMARY_PROMPT_TEMPLATE.format(transcript=transcript)
+def summarize_with_claude(transcript: str, claude_bin: str, multitrack: bool) -> str:
+    if multitrack:
+        format_note = (
+            "各行は `[hh:mm:ss] 話者名: 発言内容` 形式です。話者を区別して議論の流れを"
+            "正確に追えます。"
+        )
+        speaker_hint_topic = "。発言者が誰かを明示すると読みやすい"
+        speaker_hint_todo = "。担当者は文字起こし中の話者名から特定してよい"
+    else:
+        format_note = "話者ラベルなしの素の文字起こしです (mix 録音)。"
+        speaker_hint_topic = ""
+        speaker_hint_todo = ""
+    prompt = SUMMARY_PROMPT_TEMPLATE.format(
+        transcript=transcript,
+        format_note=format_note,
+        speaker_hint_topic=speaker_hint_topic,
+        speaker_hint_todo=speaker_hint_todo,
+    )
     proc = subprocess.run(
         [claude_bin, "-p", prompt],
         check=False,
@@ -348,6 +601,9 @@ def main(argv: Iterable[str] | None = None) -> int:
                         help="文字起こしを指定パスに保存")
     parser.add_argument("--save-summary", default=None,
                         help="要約を指定パスに保存")
+    parser.add_argument("--mode", choices=["auto", "single", "multitrack"],
+                        default="auto",
+                        help="auto: ZIP かつ複数トラックを検出したら multitrack に切替")
     args = parser.parse_args(argv)
 
     groq_key = require_env("GROQ_API_KEY")
@@ -368,22 +624,34 @@ def main(argv: Iterable[str] | None = None) -> int:
         # 1. 録音取得
         raw = fetch_recording(args.source, workdir)
 
-        # 2. Whisper 用に変換し、必要なら分割
-        log("[2/4] 音声を変換中...")
-        audio = to_whisper_friendly(raw, workdir)
-        chunks = split_if_large(audio, workdir)
+        # モード判定
+        if args.mode == "multitrack":
+            multitrack = True
+        elif args.mode == "single":
+            multitrack = False
+        else:
+            multitrack = is_multitrack_source(raw)
+        log(f"  モード: {'multitrack' if multitrack else 'single'}")
 
-        # 3. 文字起こし
-        log(f"[3/4] Whisper ({WHISPER_MODEL}) で文字起こし中...")
+        # 2-3. 文字起こし
         groq = Groq(api_key=groq_key)
-        transcript = transcribe_all(chunks, groq, args.language or None)
+        if multitrack:
+            log(f"[2-3/4] マルチトラックを Whisper ({WHISPER_MODEL}) で文字起こし中...")
+            transcript = run_multitrack(raw, groq, args.language or None, workdir)
+        else:
+            log("[2/4] 音声を変換中...")
+            audio = to_whisper_friendly(raw, workdir)
+            chunks = split_if_large(audio, workdir)
+            log(f"[3/4] Whisper ({WHISPER_MODEL}) で文字起こし中...")
+            transcript = transcribe_all(chunks, groq, args.language or None)
+
         if args.save_transcript:
             Path(args.save_transcript).write_text(transcript, encoding="utf-8")
             log(f"  文字起こしを保存: {args.save_transcript}")
 
         # 4. Claude Code で要約
         log("[4/4] Claude Code で要約中...")
-        summary_md = summarize_with_claude(transcript, args.claude_bin)
+        summary_md = summarize_with_claude(transcript, args.claude_bin, multitrack)
         if args.save_summary:
             Path(args.save_summary).write_text(summary_md, encoding="utf-8")
             log(f"  要約を保存: {args.save_summary}")
