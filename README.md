@@ -52,10 +52,12 @@ NOTION_PARENT_ID=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 uv run pipeline.py input/craig-xxx.flac
 ```
 
-出力先 / Notion タイトルは実行日から自動決定:
-- `output/yyyy-mm-dd.transcript.txt`
-- `output/yyyy-mm-dd.summary.md`
-- Notion ページタイトル: `yyyy-mm-dd mtg`
+出力先 / Notion タイトルは実行時刻から自動決定:
+- `output/yyyy-mm-dd_HHMM.transcript.txt`
+- `output/yyyy-mm-dd_HHMM.summary.md`
+- Notion ページタイトル: `yyyy-mm-dd mtg` (時刻なし)
+
+同じ日に複数回実行しても時刻サフィックスで上書きを回避します。`--post-only` は当日の最新ペアを自動で拾います。
 
 ### multitrack モード (推奨: 話者付き議事録)
 
@@ -87,7 +89,7 @@ uv run pipeline.py input.flac --mode multitrack   # 通常エラーになる
 # Notion 投稿せず結果だけ確認
 uv run pipeline.py recording.flac --skip-notion
 
-# Notion 投稿だけリトライ (当日の output/yyyy-mm-dd.* を読み直す)
+# Notion 投稿だけリトライ (当日の output/yyyy-mm-dd_HHMM.* の最新ペアを読む)
 uv run pipeline.py --post-only
 
 # shebang 経由 (実行ビットを立てた場合)
@@ -105,7 +107,7 @@ chmod +x pipeline.py
 | `--skip-notion` | Notion 投稿をスキップ |
 | `--keep-workdir` | 中間ファイルの作業ディレクトリを残す |
 | `--mode {auto,single,multitrack}` | 動作モード強制 (既定: auto) |
-| `--post-only` | Whisper/Claude をスキップして当日の `output/yyyy-mm-dd.*` を投稿 |
+| `--post-only` | Whisper/Claude をスキップして当日の `output/yyyy-mm-dd_HHMM.*` 最新ペアを投稿 |
 | `--property NAME=VALUE` | DB の追加プロパティ。複数回指定可。multi_select は `,` 区切り。例: `--property 'カテゴリー=議事録,定例'` |
 
 ## パイプラインの流れ

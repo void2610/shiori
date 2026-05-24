@@ -64,13 +64,32 @@ OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 
 
 def today_artifacts() -> tuple[str, Path, Path]:
-    """(title, transcript_path, summary_path) を実行日から生成して返す。"""
-    date = f"{datetime.now():%Y-%m-%d}"
+    """新規記録用に (title, transcript_path, summary_path) を返す。
+
+    同日複数回実行を区別するためファイル名には時刻サフィックスを付ける。
+    Notion タイトルは時刻なしで yyyy-mm-dd mtg のまま (DB 側で時刻を見たい
+    場合は created_time プロパティで十分なので)。
+    """
+    now = datetime.now()
+    date = f"{now:%Y-%m-%d}"
+    stamp = f"{now:%Y-%m-%d_%H%M}"
     return (
         f"{date} mtg",
-        OUTPUT_DIR / f"{date}.transcript.txt",
-        OUTPUT_DIR / f"{date}.summary.md",
+        OUTPUT_DIR / f"{stamp}.transcript.txt",
+        OUTPUT_DIR / f"{stamp}.summary.md",
     )
+
+
+def latest_today_artifacts() -> tuple[str, Path, Path]:
+    """--post-only 用に、当日生成された最新の出力ペアを返す。"""
+    date = f"{datetime.now():%Y-%m-%d}"
+    summaries = sorted(OUTPUT_DIR.glob(f"{date}*.summary.md"))
+    if not summaries:
+        sys.exit(f"当日 ({date}) の要約ファイルが output/ に見つかりません")
+    summary = summaries[-1]
+    transcript = summary.with_name(summary.name.removesuffix(".summary.md")
+                                    + ".transcript.txt")
+    return f"{date} mtg", transcript, summary
 
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "whisper-large-v3")
 
@@ -730,14 +749,13 @@ def main(argv: Iterable[str] | None = None) -> int:
                              "(複数回指定可)")
     args = parser.parse_args(argv)
 
-    title, transcript_path, summary_path = today_artifacts()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     if args.post_only:
         if args.skip_notion:
             sys.exit("--post-only と --skip-notion は同時指定できません")
-        if not summary_path.exists():
-            sys.exit(f"要約ファイルが見つかりません: {summary_path}")
+        title, transcript_path, summary_path = latest_today_artifacts()
+        log(f"  読み込み: {summary_path.name}")
         notion_key = require_env("NOTION_API_KEY")
         parent_id = require_env("NOTION_PARENT_ID")
         summary_md = summary_path.read_text(encoding="utf-8")
@@ -753,6 +771,8 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     if not args.source:
         sys.exit("source 引数 (録音ファイル or URL) が必要です")
+
+    title, transcript_path, summary_path = today_artifacts()
 
     groq_key = require_env("GROQ_API_KEY")
     notion_key = parent_id = None
