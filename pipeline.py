@@ -3,7 +3,6 @@
 # requires-python = ">=3.10"
 # dependencies = [
 #   "groq>=0.11.0",
-#   "notion-client>=2.2.1",
 #   "requests>=2.31.0",
 #   "python-dotenv>=1.0.0",
 # ]
@@ -45,7 +44,6 @@ from urllib.parse import urlparse
 import requests
 from dotenv import load_dotenv
 from groq import Groq
-from notion_client import APIErrorCode, APIResponseError, Client as NotionClient
 
 # スクリプトと同階層の .env を最優先、次にカレントの .env を読む。
 # 既存の環境変数は上書きしない (export 済みの値を尊重)。
@@ -57,6 +55,9 @@ MAX_CHUNK_BYTES = 24 * 1024 * 1024
 # Notion の rich_text 1 要素は 2000 文字、children は 1 リクエスト 100 ブロックまで。
 NOTION_TEXT_CHUNK = 1900
 NOTION_BLOCK_BATCH = 100
+# Data Source 形式 (DB を data_sources 配列で返す) は 2025-09-03 から。
+NOTION_API_BASE = "https://api.notion.com/v1"
+NOTION_VERSION = "2025-09-03"
 
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "whisper-large-v3")
 
@@ -498,89 +499,134 @@ def transcript_blocks(transcript: str) -> list[dict]:
 
 # ---------- 6. Notion へ投稿 ----------
 
-def detect_parent_type(notion: NotionClient, parent_id: str) -> str:
-    """親 ID を Notion に問い合わせて page / database を自動判定する。"""
-    try:
-        notion.databases.retrieve(database_id=parent_id)
-        return "database"
-    except APIResponseError as e:
-        if e.code != APIErrorCode.ObjectNotFound:
-            raise
-    try:
-        notion.pages.retrieve(page_id=parent_id)
-        return "page"
-    except APIResponseError as e:
-        if e.code == APIErrorCode.ObjectNotFound:
-            sys.exit(
-                f"Notion 親 ID {parent_id} にアクセスできません。\n"
-                "以下を確認してください:\n"
-                "  1. ID が正しいか (URL 末尾の 32 桁ハッシュ)\n"
-                "  2. 親ページ / DB を Notion で開き、… → Connections で\n"
-                "     インテグレーション 'shiori' を招待しているか\n"
-                "  3. データベースに投稿したい場合は、ページではなく\n"
-                "     DB そのものにインテグレーションを招待\n"
-            )
-        raise
+class NotionError(RuntimeError):
+    def __init__(self, status: int, body: dict | str):
+        self.status = status
+        self.body = body
+        code = body.get("code") if isinstance(body, dict) else None
+        msg = body.get("message", body) if isinstance(body, dict) else body
+        super().__init__(f"Notion API {status} ({code}): {msg}")
 
 
-def _database_title_prop(notion: NotionClient, database_id: str) -> str:
-    """DB のタイトル列名は任意 (Name / 名前 / Title 等) なのでスキーマから取得。"""
-    db = notion.databases.retrieve(database_id=database_id)
-    props = db.get("properties", {})
-    if not props:
-        # Notion の 2025-09+ Data Source 形式では properties は別エンドポイント。
-        # 現状の notion-client はこの形式への直接投稿に未対応。
-        data_sources = db.get("data_sources") or []
-        msg = (
-            f"データベース {database_id} の properties を取得できませんでした。\n"
-            "原因として最も多いのは Notion の 2025-09 以降の Data Source 形式 DB です\n"
-            "(notion-client の現バージョンは未対応)。\n"
-            "\n対処 (推奨): 親をふつうのページに変更してください\n"
-            "  1. Notion で新規ページを作成 (タイトル例: '通話メモ')\n"
-            "  2. そのページの右上 … → Connections で 'shiori' を招待\n"
-            "  3. .env の NOTION_PARENT_ID をそのページの URL 末尾 32 桁に置換\n"
-            "  4. NOTION_PARENT_TYPE は削除 (auto で動きます)\n"
-        )
-        if data_sources:
-            ds_ids = [ds.get("id") for ds in data_sources]
-            msg += f"\n参考: 検出された data_sources: {ds_ids}\n"
-        sys.exit(msg)
+def _notion_request(token: str, method: str, path: str, body: dict | None = None) -> dict:
+    r = requests.request(
+        method,
+        f"{NOTION_API_BASE}/{path}",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Notion-Version": NOTION_VERSION,
+            "Content-Type": "application/json",
+        },
+        json=body,
+        timeout=60,
+    )
+    if r.status_code >= 400:
+        try:
+            err = r.json()
+        except ValueError:
+            err = r.text
+        raise NotionError(r.status_code, err)
+    return r.json()
+
+
+def _find_title_prop(props: dict) -> str | None:
     for name, prop in props.items():
         if prop.get("type") == "title":
             return name
-    sys.exit(
-        f"データベース {database_id} に title 型のプロパティが見つかりません。"
-        f" 利用可能: {list(props.keys())}"
-    )
+    return None
+
+
+def resolve_notion_target(
+    token: str,
+    parent_id: str,
+    parent_type: str,
+) -> tuple[dict, str]:
+    """親 ID を解決し、pages.create 用の parent オブジェクトと title プロパティ名を返す。
+
+    - parent_type=auto: API に問い合わせて DB / Page を自動判定
+    - DB の場合: 2025-09-03 仕様で data_sources を辿り data_source_id 親を使う
+    - Page の場合: page_id 親を使う
+    """
+    if parent_type == "auto":
+        try:
+            _notion_request(token, "GET", f"databases/{parent_id}")
+            parent_type = "database"
+        except NotionError as e:
+            if e.status != 404:
+                raise
+            try:
+                _notion_request(token, "GET", f"pages/{parent_id}")
+                parent_type = "page"
+            except NotionError as e2:
+                if e2.status == 404:
+                    sys.exit(
+                        f"Notion 親 ID {parent_id} にアクセスできません。\n"
+                        "  1. ID が正しいか (URL 末尾の 32 桁ハッシュ)\n"
+                        "  2. 親ページ/DB を Notion で開き、… → Connections で\n"
+                        "     インテグレーション 'shiori' を招待しているか\n"
+                        "  3. DB に投稿したい場合は、親ページではなく\n"
+                        "     DB そのものにインテグレーションを招待\n"
+                    )
+                raise
+
+    if parent_type == "page":
+        return {"type": "page_id", "page_id": parent_id}, "title"
+
+    # parent_type == "database"
+    db = _notion_request(token, "GET", f"databases/{parent_id}")
+    data_sources = db.get("data_sources") or []
+
+    if data_sources:
+        # 2025-09-03 仕様: data_source 経由で投稿
+        if len(data_sources) > 1:
+            log(
+                f"  data_sources が {len(data_sources)} 件検出、"
+                f"先頭を使用: {data_sources[0].get('name')}"
+            )
+        ds_id = data_sources[0]["id"]
+        ds = _notion_request(token, "GET", f"data_sources/{ds_id}")
+        props = ds.get("properties", {})
+        title_prop = _find_title_prop(props)
+        if title_prop is None:
+            sys.exit(
+                f"data_source {ds_id} に title プロパティがありません。"
+                f" 利用可能: {list(props.keys())}"
+            )
+        return {"type": "data_source_id", "data_source_id": ds_id}, title_prop
+
+    # 旧形式 DB の互換 (properties が DB レスポンスに直接含まれる)
+    props = db.get("properties", {})
+    title_prop = _find_title_prop(props)
+    if title_prop is None:
+        sys.exit(
+            f"DB {parent_id} に title プロパティがありません。"
+            f" 利用可能: {list(props.keys())}"
+        )
+    return {"type": "database_id", "database_id": parent_id}, title_prop
 
 
 def post_to_notion(
-    notion: NotionClient,
+    token: str,
     parent_id: str,
     parent_type: str,
     title: str,
     body_blocks: list[dict],
 ) -> str:
-    if parent_type == "database":
-        parent = {"database_id": parent_id}
-        title_prop = _database_title_prop(notion, parent_id)
-        properties = {title_prop: {"title": _rich_text(title)}}
-    else:
-        parent = {"page_id": parent_id}
-        properties = {"title": {"title": _rich_text(title)}}
+    parent, title_prop = resolve_notion_target(token, parent_id, parent_type)
+    log(f"  Notion 親: {parent['type']} = {parent[parent['type']]}")
 
-    page = notion.pages.create(
-        parent=parent,
-        properties=properties,
-        children=body_blocks[:NOTION_BLOCK_BATCH],
-    )
+    properties = {title_prop: {"title": _rich_text(title)}}
+    page = _notion_request(token, "POST", "pages", {
+        "parent": parent,
+        "properties": properties,
+        "children": body_blocks[:NOTION_BLOCK_BATCH],
+    })
     page_id = page["id"]
 
     for i in range(NOTION_BLOCK_BATCH, len(body_blocks), NOTION_BLOCK_BATCH):
-        notion.blocks.children.append(
-            block_id=page_id,
-            children=body_blocks[i:i + NOTION_BLOCK_BATCH],
-        )
+        _notion_request(token, "PATCH", f"blocks/{page_id}/children", {
+            "children": body_blocks[i:i + NOTION_BLOCK_BATCH],
+        })
     return page.get("url", f"https://www.notion.so/{page_id.replace('-', '')}")
 
 
@@ -633,14 +679,10 @@ def main(argv: Iterable[str] | None = None) -> int:
         transcript = (Path(args.transcript_file).read_text(encoding="utf-8")
                       if args.transcript_file else "")
         title = args.title or f"Discord 通話メモ {datetime.now():%Y-%m-%d %H:%M}"
-        notion = NotionClient(auth=notion_key)
-        parent_type = (detect_parent_type(notion, parent_id)
-                       if args.parent_type == "auto" else args.parent_type)
-        log(f"  Notion 親種別: {parent_type}")
         body = md_to_blocks(summary_md)
         if transcript:
             body += transcript_blocks(transcript)
-        url = post_to_notion(notion, parent_id, parent_type, title, body)
+        url = post_to_notion(notion_key, parent_id, args.parent_type, title, body)
         print(f"Notion に投稿しました: {url}")
         return 0
 
@@ -706,12 +748,8 @@ def main(argv: Iterable[str] | None = None) -> int:
             return 0
 
         # 5. Notion 投稿
-        notion = NotionClient(auth=notion_key)
-        parent_type = (detect_parent_type(notion, parent_id)
-                       if args.parent_type == "auto" else args.parent_type)
-        log(f"  Notion 親種別: {parent_type}")
         body = md_to_blocks(summary_md) + transcript_blocks(transcript)
-        url = post_to_notion(notion, parent_id, parent_type, title, body)
+        url = post_to_notion(notion_key, parent_id, args.parent_type, title, body)
         print(f"Notion に投稿しました: {url}")
         return 0
     finally:
