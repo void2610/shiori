@@ -122,6 +122,7 @@ uv run python src/cli.py input.zip
 | `--language` | Whisper 言語コード (既定 `ja`、空文字で自動判定) |
 | `--parent-type {auto,page,database}` | Notion 親種別 (既定: auto = API 自動判定) |
 | `--claude-bin` | `claude` CLI のパス |
+| `--context-file PATH` | 要約時に Claude へ渡す事前情報 (参加者・議題・固有名詞等) のテキストファイル |
 | `--skip-notion` | Notion 投稿をスキップ |
 | `--keep-workdir` | 中間ファイルの作業ディレクトリを残す |
 | `--mode {auto,single,multitrack}` | 動作モード強制 (既定: auto) |

@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from pathlib import Path
 
 SUMMARY_PROMPT_TEMPLATE = """以下は Discord で行われた通話の文字起こしです。日本語で読みやすい議事録 (Markdown) に整形してください。
 
 # 入力フォーマット
 {format_note}
-
+{context_section}
 # 出力フォーマット
 ## 概要
 - 通話全体を 3〜5 行で要約
@@ -30,13 +31,25 @@ SUMMARY_PROMPT_TEMPLATE = """以下は Discord で行われた通話の文字起
 - 文字起こしは音声認識の誤りを含むため、明らかに不自然な単語は文脈から補正してよい
 - 推測で情報を増やさない。元の発言にない事実は書かない
 - 出力は Markdown 本文のみ。前置きや「了解しました」等は不要
+- 事前情報がある場合、固有名詞の表記や参加者名はそれに従う。ただし事前情報だけを根拠に議事録の事実を増やさない
 
 # 文字起こし
 {transcript}
 """
 
 
-def summarize_with_claude(transcript: str, claude_bin: str, multitrack: bool) -> str:
+def load_context_file(path: str | None) -> str:
+    if path is None:
+        return ""
+    return Path(path).read_text(encoding="utf-8").strip()
+
+
+def summarize_with_claude(
+    transcript: str,
+    claude_bin: str,
+    multitrack: bool,
+    extra_context: str = "",
+) -> str:
     if multitrack:
         format_note = (
             "各行は `[hh:mm:ss] 話者名: 発言内容` 形式です。話者を区別して議論の流れを"
@@ -48,9 +61,17 @@ def summarize_with_claude(transcript: str, claude_bin: str, multitrack: bool) ->
         format_note = "話者ラベルなしの素の文字起こしです (mix 録音)。"
         speaker_hint_topic = ""
         speaker_hint_todo = ""
+    context_section = ""
+    if extra_context:
+        context_section = (
+            "\n# 事前情報 (ユーザー提供)\n"
+            "参加者・議題・固有名詞などの補足です。文字起こしの解釈に利用してください。\n\n"
+            f"{extra_context}\n"
+        )
     prompt = SUMMARY_PROMPT_TEMPLATE.format(
         transcript=transcript,
         format_note=format_note,
+        context_section=context_section,
         speaker_hint_topic=speaker_hint_topic,
         speaker_hint_todo=speaker_hint_todo,
     )

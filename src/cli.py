@@ -21,7 +21,7 @@ from config import (
 )
 from notion import md_to_blocks, post_to_notion, transcript_blocks
 from recording import fetch_recording
-from summarize import summarize_with_claude
+from summarize import load_context_file, summarize_with_claude
 from util import log, require_env
 from whisper import run_multitrack, transcribe_all
 
@@ -43,6 +43,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--claude-bin",
                         default=os.environ.get("CLAUDE_BIN", "claude"),
                         help="claude CLI の実行パス")
+    parser.add_argument("--context-file", default=None, metavar="PATH",
+                        help="要約時に Claude へ渡す事前情報 (参加者・議題・固有名詞等) "
+                             "のテキストファイル")
     parser.add_argument("--keep-workdir", action="store_true",
                         help="作業ディレクトリを残す (デバッグ用)")
     parser.add_argument("--skip-notion", action="store_true",
@@ -104,6 +107,11 @@ def _run_pipeline(args: argparse.Namespace) -> int:
 
     if shutil.which(args.claude_bin) is None:
         sys.exit(f"claude CLI が見つかりません: {args.claude_bin}")
+    # 長い文字起こし処理の後で「ファイルがない」で落ちないよう先に読む
+    try:
+        extra_context = load_context_file(args.context_file)
+    except OSError as e:
+        sys.exit(f"--context-file を読めません: {e}")
     if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
         sys.exit("ffmpeg / ffprobe が PATH 上に必要です")
 
@@ -137,7 +145,8 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         log(f"  文字起こしを保存: {transcript_path}")
 
         log("[4/4] Claude Code で要約中...")
-        summary_md = summarize_with_claude(transcript, args.claude_bin, multitrack)
+        summary_md = summarize_with_claude(transcript, args.claude_bin, multitrack,
+                                           extra_context)
         summary_path.write_text(summary_md, encoding="utf-8")
         log(f"  要約を保存: {summary_path}")
 
