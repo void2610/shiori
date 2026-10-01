@@ -104,13 +104,13 @@ def split_with_offsets(audio: Path, workdir: Path) -> list[tuple[Path, float]]:
 
 
 def is_multitrack_source(path: Path) -> bool:
-    """ZIP 内に Craig 命名規則のトラックが 2 個以上あればマルチトラック。"""
+    """ZIP 内に Craig 命名規則のトラックがあればマルチトラック (1 人だけの録音も ZIP で届くため 1 個でも扱う)。"""
     if path.suffix.lower() != ".zip":
         return False
     try:
         with zipfile.ZipFile(path) as zf:
             tracks = [n for n in zf.namelist() if TRACK_NAME_RE.match(Path(n).name)]
-        return len(tracks) >= 2
+        return len(tracks) >= 1
     except zipfile.BadZipFile:
         return False
 
