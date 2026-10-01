@@ -20,7 +20,8 @@ Craig (録音) ─► Groq Whisper (文字起こし) ─► Claude Code (要約)
 ```
 pyproject.toml
 uv.lock
-src/
+src/shiori/
+  __main__.py        # python -m shiori
   cli.py             # argparse + main
   config.py          # .env ロード、定数、出力ファイル名生成
   util.py            # log / require_env / stream_download
@@ -112,7 +113,7 @@ uv run shiori --post-only
 uv run shiori --post-only --property 'カテゴリー=議事録'
 
 # python 直接呼び出しでも動く
-uv run python src/cli.py input.zip
+uv run python -m shiori input.zip
 ```
 
 ## オプション

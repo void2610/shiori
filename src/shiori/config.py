@@ -1,7 +1,7 @@
 """定数群と .env ロード、出力ファイル名の生成。
 
-このモジュールは import 時に .env を読み込む副作用を持つ
-(プロジェクトルート/.env → cwd/.env の順、既存環境変数は尊重)。
+このモジュールは import 時に cwd から上方向に探した .env を読み込む副作用を持つ
+(既存環境変数は尊重)。
 """
 
 from __future__ import annotations
@@ -12,13 +12,10 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import find_dotenv, load_dotenv
 
-# config.py は <root>/src/config.py なので parent.parent がプロジェクトルート。
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-
-load_dotenv(PROJECT_ROOT / ".env", override=False)
-load_dotenv(override=False)
+# 依存パッケージとしてインストールされると __file__ は site-packages 配下になるため cwd 基準で探す
+load_dotenv(find_dotenv(usecwd=True), override=False)
 
 # Groq Whisper の 1 リクエスト上限は 25MB。少し余裕を持たせる。
 MAX_CHUNK_BYTES = 24 * 1024 * 1024
@@ -41,8 +38,8 @@ TRACK_NAME_RE = re.compile(
     re.IGNORECASE,
 )
 
-# 出力先 (プロジェクトルート/output)。タイトル/ファイル名は実行日から自動生成。
-OUTPUT_DIR = PROJECT_ROOT / "output"
+# 出力先 (既定は cwd/output)。タイトル/ファイル名は実行日から自動生成。
+OUTPUT_DIR = Path(os.environ.get("SHIORI_OUTPUT_DIR", "output")).expanduser().resolve()
 
 
 def today_artifacts() -> tuple[str, Path, Path]:
