@@ -15,9 +15,7 @@ dependencies = [
 ]
 
 [project.scripts]
-shiori = "cli:main"
+shiori = "shiori.cli:main"
 
-# src/ 直下のフラットモジュール群を wheel ルートに展開する。
 [tool.hatch.build.targets.wheel]
-sources = ["src"]
-only-include = ["src"]
+packages = ["src/shiori"]
