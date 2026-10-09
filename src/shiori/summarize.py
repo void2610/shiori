@@ -82,8 +82,7 @@ def summarize_with_claude(
         text=True,
     )
     if proc.returncode != 0:
-        sys.exit(
-            f"claude CLI がエラー終了しました (exit={proc.returncode})\n"
-            f"stderr:\n{proc.stderr}"
-        )
+        # claude -p は認証エラーなどを標準出力に出すため、stderr だけでは原因が分からない
+        detail = "\n".join(s.strip() for s in (proc.stdout, proc.stderr) if s.strip())
+        sys.exit(f"claude CLI がエラー終了しました (exit={proc.returncode})\n{detail}")
     return proc.stdout.strip()
